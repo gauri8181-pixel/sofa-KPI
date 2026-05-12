@@ -136,9 +136,12 @@ def _execute_pipeline(url: str, token: str, statements: list[tuple]) -> list[dic
     각 statement의 결과를 dict 리스트로 반환
     """
     endpoint = _http_endpoint(url)
+    # 모든 헤더는 ASCII로 강제
     headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}".encode("ascii", "ignore").decode("ascii"),
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json",
+        "Connection": "close",
     }
     requests_body = []
     for sql, params in statements:
@@ -152,8 +155,12 @@ def _execute_pipeline(url: str, token: str, statements: list[tuple]) -> list[dic
     requests_body.append({"type": "close"})
 
     body = {"requests": requests_body}
-    r = requests.post(endpoint, headers=headers, json=body, timeout=60)
+    # ensure_ascii=True → 한글 등 비ASCII를 \uXXXX로 이스케이프, 결과는 순수 ASCII
+    body_bytes = json.dumps(body, ensure_ascii=True).encode("ascii")
+    r = requests.post(endpoint, headers=headers, data=body_bytes, timeout=60)
     r.raise_for_status()
+    # 응답은 UTF-8로 디코딩
+    r.encoding = "utf-8"
     data = r.json()
 
     results = []

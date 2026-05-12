@@ -157,16 +157,24 @@ def _execute_pipeline(url: str, token: str, statements: list[tuple]) -> list[dic
     body = {"requests": requests_body}
     # ensure_ascii=True → 한글 등 비ASCII를 \uXXXX로 이스케이프, 결과는 순수 ASCII
     body_bytes = json.dumps(body, ensure_ascii=True).encode("ascii")
-    r = requests.post(endpoint, headers=headers, data=body_bytes, timeout=60)
+    try:
+        r = requests.post(endpoint, headers=headers, data=body_bytes, timeout=60)
+    except Exception as e:
+        st.error(f"❌ Turso 연결 실패\nEndpoint: {endpoint}\nError: {type(e).__name__}: {e}")
+        st.stop()
     # 응답 본문을 항상 UTF-8로 디코딩
     r.encoding = "utf-8"
     if r.status_code != 200:
-        # 서버가 돌려준 실제 에러 메시지를 그대로 노출
-        body_preview = r.text[:1000] if r.text else "(empty body)"
-        raise RuntimeError(
-            f"Turso HTTP {r.status_code} @ {endpoint}\n"
-            f"Response: {body_preview}"
+        # 서버가 돌려준 실제 에러 메시지를 그대로 UI에 노출 (redaction 회피)
+        body_preview = r.text[:2000] if r.text else "(empty body)"
+        first_sql = statements[0][0][:200] if statements else "(no sql)"
+        st.error(
+            f"❌ Turso HTTP {r.status_code}\n\n"
+            f"**Endpoint:** {endpoint}\n\n"
+            f"**First SQL:** {first_sql}\n\n"
+            f"**Server response:**\n```\n{body_preview}\n```"
         )
+        st.stop()
     data = r.json()
 
     results = []

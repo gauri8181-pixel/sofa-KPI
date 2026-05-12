@@ -3,5 +3,4 @@ pandas
 numpy
 plotly
 openpyxl
-matplotlib
 libsql-experimental

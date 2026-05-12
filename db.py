@@ -158,9 +158,15 @@ def _execute_pipeline(url: str, token: str, statements: list[tuple]) -> list[dic
     # ensure_ascii=True → 한글 등 비ASCII를 \uXXXX로 이스케이프, 결과는 순수 ASCII
     body_bytes = json.dumps(body, ensure_ascii=True).encode("ascii")
     r = requests.post(endpoint, headers=headers, data=body_bytes, timeout=60)
-    r.raise_for_status()
-    # 응답은 UTF-8로 디코딩
+    # 응답 본문을 항상 UTF-8로 디코딩
     r.encoding = "utf-8"
+    if r.status_code != 200:
+        # 서버가 돌려준 실제 에러 메시지를 그대로 노출
+        body_preview = r.text[:1000] if r.text else "(empty body)"
+        raise RuntimeError(
+            f"Turso HTTP {r.status_code} @ {endpoint}\n"
+            f"Response: {body_preview}"
+        )
     data = r.json()
 
     results = []

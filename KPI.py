@@ -836,10 +836,7 @@ with tab2:
                 "실적금액": "₩{:,.0f}",
                 "수량 달성률(%)": "{:.1f}%",
                 "금액 달성률(%)": "{:.1f}%",
-            }).background_gradient(
-                subset=["수량 달성률(%)", "금액 달성률(%)"],
-                cmap="RdYlGn", vmin=0, vmax=100,
-            ),
+            }),
             use_container_width=True,
             hide_index=True,
         )

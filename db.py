@@ -1,36 +1,32 @@
 # db.py
-# Turso (libSQL) 기반 KPI 데이터 저장소
-# - SQLite 호환 클라우드 DB. 기존 SQLite 쿼리 그대로 동작.
-# - Streamlit Cloud 재시작에도 데이터 영구 보존.
+# Turso HTTP API (Hrana over HTTP) 기반 KPI 데이터 저장소
+# - 별도 네이티브 패키지 불필요 (requests만 사용)
+# - 어떤 Python 버전에서도 동작
+# - 인터페이스는 기존 SQLite/libsql 버전과 동일 → KPI.py 수정 불필요
 #
-# 자격증명 우선순위:
-#   1) Streamlit Secrets [turso] (배포 환경)
+# 자격증명:
+#   1) Streamlit Secrets [turso] (배포)
 #   2) 환경변수 TURSO_DATABASE_URL / TURSO_AUTH_TOKEN
-#   3) 둘 다 없으면 로컬 SQLite 파일 (개발 모드)
-#
-# 사전 준비:
-#   1. https://turso.tech 가입 (GitHub 로그인)
-#   2. 데이터베이스 생성 (예: sofa-kpi)
-#   3. URL + Auth Token 발급
-#   4. Streamlit Secrets에 등록 (또는 .streamlit/secrets.toml)
+#   3) 둘 다 없으면 로컬 SQLite (개발)
 
+import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
+import requests
 import streamlit as st
 
 DB_PATH = Path("data") / "kpi.db"
 UPLOADS_DIR = Path("data") / "uploads"
 
 # =========================
-# 스키마 (CREATE 문 리스트)
+# 스키마
 # =========================
 SCHEMA_STATEMENTS = [
-    """
-    CREATE TABLE IF NOT EXISTS upload_log (
+    """CREATE TABLE IF NOT EXISTS upload_log (
         upload_id INTEGER PRIMARY KEY AUTOINCREMENT,
         team TEXT NOT NULL,
         filename TEXT,
@@ -39,10 +35,8 @@ SCHEMA_STATEMENTS = [
         plan_rows INTEGER DEFAULT 0,
         hours_rows INTEGER DEFAULT 0,
         note TEXT
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS production_plan (
+    )""",
+    """CREATE TABLE IF NOT EXISTS production_plan (
         row_id INTEGER PRIMARY KEY AUTOINCREMENT,
         upload_id INTEGER NOT NULL,
         관리번호 TEXT,
@@ -58,18 +52,15 @@ SCHEMA_STATEMENTS = [
         실적금액 REAL,
         최초포장계획일 TEXT,
         포장계획일 TEXT
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS production_hours (
+    )""",
+    """CREATE TABLE IF NOT EXISTS production_hours (
         row_id INTEGER PRIMARY KEY AUTOINCREMENT,
         upload_id INTEGER NOT NULL,
         날짜 TEXT NOT NULL,
         근무시간 REAL,
         이월수량 REAL,
         이월금액 REAL
-    )
-    """,
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_plan_init_date ON production_plan(최초포장계획일)",
     "CREATE INDEX IF NOT EXISTS idx_plan_pack_date ON production_plan(포장계획일)",
     "CREATE INDEX IF NOT EXISTS idx_plan_upload  ON production_plan(upload_id)",
@@ -81,10 +72,9 @@ SCHEMA_STATEMENTS = [
 
 
 # =========================
-# 자격증명 / 연결
+# 자격증명
 # =========================
 def _get_turso_creds():
-    """Streamlit Secrets 또는 환경변수에서 Turso URL/Token 로드"""
     try:
         if "turso" in st.secrets:
             return (
@@ -93,64 +83,171 @@ def _get_turso_creds():
             )
     except Exception:
         pass
-
     url = os.environ.get("TURSO_DATABASE_URL", "")
     token = os.environ.get("TURSO_AUTH_TOKEN", "")
     return url, token
 
 
-def get_conn():
-    """Turso 임베디드 레플리카 연결 (creds 없으면 순수 로컬 SQLite)"""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    url, token = _get_turso_creds()
+def _http_endpoint(url: str) -> str:
+    if url.startswith("libsql://"):
+        url = "https://" + url[len("libsql://"):]
+    return url.rstrip("/") + "/v2/pipeline"
 
-    if url and token:
+
+# =========================
+# Hrana HTTP 변환
+# =========================
+def _to_hrana_arg(val):
+    if val is None:
+        return {"type": "null"}
+    if isinstance(val, bool):
+        return {"type": "integer", "value": "1" if val else "0"}
+    if isinstance(val, int):
+        return {"type": "integer", "value": str(val)}
+    if isinstance(val, float):
+        return {"type": "float", "value": val}
+    if isinstance(val, (datetime, date)):
+        return {"type": "text", "value": val.isoformat()}
+    return {"type": "text", "value": str(val)}
+
+
+def _from_hrana_cell(cell):
+    t = cell.get("type")
+    v = cell.get("value")
+    if t == "null" or v is None:
+        return None
+    if t == "integer":
         try:
-            import libsql_experimental as libsql
-
-            conn = libsql.connect(
-                str(DB_PATH), sync_url=url, auth_token=token
-            )
-            try:
-                conn.sync()  # 원격에서 최신 데이터 가져오기
-            except Exception:
-                pass
-            return conn
-        except ImportError:
-            pass  # libsql 미설치 시 SQLite로 fallback
-
-    # 로컬 fallback
-    return sqlite3.connect(str(DB_PATH))
-
-
-def _commit_sync(conn):
-    """commit + (libsql인 경우) Turso로 sync"""
-    conn.commit()
-    if hasattr(conn, "sync"):
-        try:
-            conn.sync()
+            return int(v)
         except Exception:
-            pass
+            return None
+    if t == "float":
+        try:
+            return float(v)
+        except Exception:
+            return None
+    return v
 
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    for stmt in SCHEMA_STATEMENTS:
-        cur.execute(stmt)
-    _commit_sync(conn)
+def _execute_pipeline(url: str, token: str, statements: list[tuple]) -> list[dict]:
+    """
+    statements: [(sql, params), ...] 형식의 리스트
+    여러 SQL을 한 HTTP 요청으로 전송 → 원자적(transaction)으로 실행
+    각 statement의 결과를 dict 리스트로 반환
+    """
+    endpoint = _http_endpoint(url)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    requests_body = []
+    for sql, params in statements:
+        requests_body.append({
+            "type": "execute",
+            "stmt": {
+                "sql": sql,
+                "args": [_to_hrana_arg(p) for p in (params or ())],
+            },
+        })
+    requests_body.append({"type": "close"})
+
+    body = {"requests": requests_body}
+    r = requests.post(endpoint, headers=headers, json=body, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+
+    results = []
+    for item in data.get("results", []):
+        if item.get("type") != "ok":
+            # close 응답은 type='ok'지만 다른 응답 형태일 수 있음, 에러는 위로
+            err = item.get("error", {}).get("message", "Unknown error")
+            if "type" in item and item["type"] == "error":
+                raise RuntimeError(f"Turso error: {err}")
+            results.append(None)
+            continue
+        resp = item.get("response", {})
+        if resp.get("type") == "execute":
+            res = resp.get("result", {})
+            cols = [c.get("name") for c in res.get("cols", [])]
+            rows = []
+            for raw_row in res.get("rows", []):
+                rows.append(tuple(_from_hrana_cell(c) for c in raw_row))
+            last_insert = res.get("last_insert_rowid")
+            try:
+                last_insert = int(last_insert) if last_insert is not None else None
+            except Exception:
+                last_insert = None
+            results.append({
+                "cols": cols,
+                "rows": rows,
+                "last_insert_rowid": last_insert,
+            })
+    return results
+
+
+# =========================
+# 통합 실행 함수 (Turso HTTP or 로컬 SQLite)
+# =========================
+def _is_turso() -> bool:
+    url, token = _get_turso_creds()
+    return bool(url and token)
+
+
+def _exec_one(sql: str, params: tuple = ()) -> dict:
+    """단일 SQL 실행 → {'cols','rows','last_insert_rowid'} 반환"""
+    url, token = _get_turso_creds()
+    if url and token:
+        return _execute_pipeline(url, token, [(sql, params)])[0]
+    # 로컬 SQLite fallback
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
     try:
+        cur = conn.execute(sql, params)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description] if cur.description else []
+        last = cur.lastrowid
+        conn.commit()
+        return {"cols": cols, "rows": rows, "last_insert_rowid": last}
+    finally:
         conn.close()
-    except Exception:
-        pass
 
 
-def _query_df(conn, sql: str, params: tuple = ()) -> pd.DataFrame:
-    """libsql/SQLite 공용 쿼리 → DataFrame"""
-    cur = conn.execute(sql, params)
-    rows = cur.fetchall()
-    cols = [d[0] for d in cur.description] if cur.description else []
-    return pd.DataFrame(rows, columns=cols)
+def _exec_many(statements: list[tuple]) -> list[dict]:
+    """여러 SQL 일괄 실행 (단일 HTTP 또는 단일 SQLite 트랜잭션)"""
+    url, token = _get_turso_creds()
+    if url and token:
+        return _execute_pipeline(url, token, statements)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        results = []
+        for sql, params in statements:
+            cur = conn.execute(sql, params)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description] if cur.description else []
+            results.append({
+                "cols": cols,
+                "rows": rows,
+                "last_insert_rowid": cur.lastrowid,
+            })
+        conn.commit()
+        return results
+    finally:
+        conn.close()
+
+
+# =========================
+# 초기화
+# =========================
+@st.cache_resource
+def init_db():
+    """스키마 생성 (캐시 — 세션당 1회)"""
+    _exec_many([(stmt, ()) for stmt in SCHEMA_STATEMENTS])
+    return True
+
+
+def _result_to_df(result: dict) -> pd.DataFrame:
+    return pd.DataFrame(result["rows"], columns=result["cols"])
 
 
 # =========================
@@ -176,7 +273,6 @@ def save_upload(
 ) -> int:
     init_db()
 
-    # 원본 파일 로컬 백업 (선택, 클라우드에선 휘발성)
     if file_bytes is not None:
         try:
             team_dir = UPLOADS_DIR / team
@@ -190,60 +286,65 @@ def save_upload(
     plan_n = 0 if df_plan is None else len(df_plan)
     hours_n = 0 if df_hours is None else len(df_hours)
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
+    # 1) upload_log INSERT
+    res = _exec_one(
         "INSERT INTO upload_log (team, filename, plan_rows, hours_rows) VALUES (?, ?, ?, ?)",
         (team, filename, plan_n, hours_n),
     )
-
-    # upload_id 가져오기 (lastrowid가 libsql에서 동작하지 않을 수 있어 SELECT 사용)
-    upload_id = None
-    if hasattr(cur, "lastrowid") and cur.lastrowid:
-        upload_id = cur.lastrowid
+    upload_id = res.get("last_insert_rowid")
     if not upload_id:
-        cur2 = conn.execute(
+        # last_insert_rowid가 0/None이면 직접 SELECT
+        sel = _exec_one(
             "SELECT upload_id FROM upload_log WHERE team=? AND filename=? ORDER BY upload_id DESC LIMIT 1",
             (team, filename),
         )
-        row = cur2.fetchone()
-        upload_id = int(row[0]) if row else None
+        if sel["rows"]:
+            upload_id = int(sel["rows"][0][0])
 
+    # 2) production_plan 일괄 INSERT (배치)
     if df_plan is not None and not df_plan.empty:
-        plan_cols = [
-            "관리번호", "품목코드", "색상", "단품명칭", "생산라인", "브랜드",
-            "계획량", "생산량", "입고단가", "계획금액", "실적금액",
-            "최초포장계획일", "포장계획일",
-        ]
-        rows_data = []
+        plan_sql = (
+            "INSERT INTO production_plan "
+            "(upload_id, 관리번호, 품목코드, 색상, 단품명칭, 생산라인, 브랜드, "
+            "계획량, 생산량, 입고단가, 계획금액, 실적금액, 최초포장계획일, 포장계획일) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        )
+        batch = []
         for _, r in df_plan.iterrows():
-            rows_data.append((
-                upload_id,
-                str(r.get("관리번호") or ""),
-                str(r.get("품목코드") or ""),
-                str(r.get("색상") or ""),
-                str(r.get("단품명칭") or ""),
-                str(r.get("생산라인") or ""),
-                str(r.get("브랜드") or ""),
-                float(r.get("계획량") or 0),
-                float(r.get("생산량") or 0),
-                float(r.get("입고단가") or 0),
-                float(r.get("계획금액") or 0),
-                float(r.get("실적금액") or 0),
-                _date_to_iso(r.get("최초포장계획일")),
-                _date_to_iso(r.get("포장계획일")),
+            batch.append((
+                plan_sql,
+                (
+                    upload_id,
+                    str(r.get("관리번호") or ""),
+                    str(r.get("품목코드") or ""),
+                    str(r.get("색상") or ""),
+                    str(r.get("단품명칭") or ""),
+                    str(r.get("생산라인") or ""),
+                    str(r.get("브랜드") or ""),
+                    float(r.get("계획량") or 0),
+                    float(r.get("생산량") or 0),
+                    float(r.get("입고단가") or 0),
+                    float(r.get("계획금액") or 0),
+                    float(r.get("실적금액") or 0),
+                    _date_to_iso(r.get("최초포장계획일")),
+                    _date_to_iso(r.get("포장계획일")),
+                ),
             ))
-        placeholders = ", ".join(["?"] * (1 + len(plan_cols)))
-        cols_sql = ", ".join(["upload_id"] + plan_cols)
-        insert_sql = f"INSERT INTO production_plan ({cols_sql}) VALUES ({placeholders})"
-        for row in rows_data:
-            cur.execute(insert_sql, row)
+        # HTTP 한도/안전을 위해 200행씩 분할
+        CHUNK = 200
+        for i in range(0, len(batch), CHUNK):
+            _exec_many(batch[i:i + CHUNK])
 
+    # 3) production_hours 일괄 INSERT
     if df_hours is not None and not df_hours.empty:
+        hours_sql = (
+            "INSERT INTO production_hours (upload_id, 날짜, 근무시간, 이월수량, 이월금액) "
+            "VALUES (?,?,?,?,?)"
+        )
+        batch = []
         for _, r in df_hours.iterrows():
-            cur.execute(
-                "INSERT INTO production_hours (upload_id, 날짜, 근무시간, 이월수량, 이월금액) "
-                "VALUES (?, ?, ?, ?, ?)",
+            batch.append((
+                hours_sql,
                 (
                     upload_id,
                     _date_to_iso(r.get("날짜")),
@@ -251,13 +352,9 @@ def save_upload(
                     float(r.get("이월수량") or 0),
                     float(r.get("이월금액") or 0),
                 ),
-            )
-
-    _commit_sync(conn)
-    try:
-        conn.close()
-    except Exception:
-        pass
+            ))
+        if batch:
+            _exec_many(batch)
 
     return upload_id
 
@@ -291,12 +388,8 @@ def query_plan(start_date, end_date, team: str = "production") -> pd.DataFrame:
       )
     """
     s, e = _date_to_iso(start_date), _date_to_iso(end_date)
-    conn = get_conn()
-    df = _query_df(conn, sql, (team, s, e, s, e))
-    try:
-        conn.close()
-    except Exception:
-        pass
+    res = _exec_one(sql, (team, s, e, s, e))
+    df = _result_to_df(res)
     for c in ["최초포장계획일", "포장계획일"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce").dt.date
@@ -321,12 +414,8 @@ def query_hours(start_date, end_date, team: str = "production") -> pd.DataFrame:
     FROM ranked
     WHERE rn = 1
     """
-    conn = get_conn()
-    df = _query_df(conn, sql, (team, _date_to_iso(start_date), _date_to_iso(end_date)))
-    try:
-        conn.close()
-    except Exception:
-        pass
+    res = _exec_one(sql, (team, _date_to_iso(start_date), _date_to_iso(end_date)))
+    df = _result_to_df(res)
     if not df.empty:
         df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce").dt.date
     return df
@@ -334,63 +423,48 @@ def query_hours(start_date, end_date, team: str = "production") -> pd.DataFrame:
 
 def list_uploads(team: str = "production") -> pd.DataFrame:
     init_db()
-    sql = """
-    SELECT upload_id, team, filename, uploaded_at,
-           is_active, plan_rows, hours_rows, note
-    FROM upload_log
-    WHERE team = ?
-    ORDER BY upload_id DESC
-    """
-    conn = get_conn()
-    df = _query_df(conn, sql, (team,))
-    try:
-        conn.close()
-    except Exception:
-        pass
-    return df
+    res = _exec_one(
+        """
+        SELECT upload_id, team, filename, uploaded_at,
+               is_active, plan_rows, hours_rows, note
+        FROM upload_log
+        WHERE team = ?
+        ORDER BY upload_id DESC
+        """,
+        (team,),
+    )
+    return _result_to_df(res)
 
 
 def set_upload_active(upload_id: int, active: bool):
     init_db()
-    conn = get_conn()
-    conn.execute(
+    _exec_one(
         "UPDATE upload_log SET is_active = ? WHERE upload_id = ?",
         (1 if active else 0, upload_id),
     )
-    _commit_sync(conn)
-    try:
-        conn.close()
-    except Exception:
-        pass
 
 
 def delete_upload(upload_id: int):
     init_db()
-    conn = get_conn()
-    conn.execute("DELETE FROM production_plan WHERE upload_id = ?", (upload_id,))
-    conn.execute("DELETE FROM production_hours WHERE upload_id = ?", (upload_id,))
-    conn.execute("DELETE FROM upload_log WHERE upload_id = ?", (upload_id,))
-    _commit_sync(conn)
-    try:
-        conn.close()
-    except Exception:
-        pass
+    _exec_many([
+        ("DELETE FROM production_plan WHERE upload_id = ?", (upload_id,)),
+        ("DELETE FROM production_hours WHERE upload_id = ?", (upload_id,)),
+        ("DELETE FROM upload_log WHERE upload_id = ?", (upload_id,)),
+    ])
 
 
 def get_active_brands(team: str = "production") -> list:
     init_db()
-    sql = """
-    SELECT DISTINCT p.브랜드 AS brand
-    FROM production_plan p
-    JOIN upload_log u ON p.upload_id = u.upload_id
-    WHERE u.is_active = 1 AND u.team = ? AND p.브랜드 IS NOT NULL
-    """
-    conn = get_conn()
-    df = _query_df(conn, sql, (team,))
-    try:
-        conn.close()
-    except Exception:
-        pass
+    res = _exec_one(
+        """
+        SELECT DISTINCT p.브랜드 AS brand
+        FROM production_plan p
+        JOIN upload_log u ON p.upload_id = u.upload_id
+        WHERE u.is_active = 1 AND u.team = ? AND p.브랜드 IS NOT NULL
+        """,
+        (team,),
+    )
+    df = _result_to_df(res)
     if df.empty:
         return []
     return sorted([b for b in df["brand"].dropna().tolist() if b])
@@ -409,17 +483,11 @@ def get_data_date_range(team: str = "production"):
         WHERE u.is_active = 1 AND u.team = ? AND p.포장계획일 IS NOT NULL
     )
     """
-    conn = get_conn()
-    cur = conn.execute(sql, (team, team))
-    row = cur.fetchone()
-    try:
-        conn.close()
-    except Exception:
-        pass
-    if not row or not row[0]:
+    res = _exec_one(sql, (team, team))
+    if not res["rows"] or not res["rows"][0][0]:
         return None, None
-    min_d = pd.to_datetime(row[0], errors="coerce")
-    max_d = pd.to_datetime(row[1], errors="coerce")
+    min_d = pd.to_datetime(res["rows"][0][0], errors="coerce")
+    max_d = pd.to_datetime(res["rows"][0][1], errors="coerce")
     return (
         min_d.date() if pd.notna(min_d) else None,
         max_d.date() if pd.notna(max_d) else None,

@@ -439,12 +439,12 @@ def parse_excel(file_bytes: bytes):
             hdf.columns = [norm_header(c) for c in hdf.columns]
             if "날짜" in hdf.columns:
                 hdf["날짜"] = pd.to_datetime(hdf["날짜"], errors="coerce").dt.date
-                for c in ["근무시간", "이월수량", "이월금액"]:
+                for c in ["근무시간", "이월수량", "이월금액", "근무인원"]:
                     if c in hdf.columns:
                         hdf[c] = pd.to_numeric(hdf[c], errors="coerce").fillna(0)
                     else:
                         hdf[c] = 0
-                df_hours = hdf[["날짜", "근무시간", "이월수량", "이월금액"]].dropna(
+                df_hours = hdf[["날짜", "근무시간", "이월수량", "이월금액", "근무인원"]].dropna(
                     subset=["날짜"]
                 )
         except Exception:
@@ -599,18 +599,21 @@ else:
 
 final_df = pd.merge(plan_agg, actual_agg, on="기간", how="outer")
 
-hours_period = pd.DataFrame(columns=["기간", "근무시간", "이월수량", "이월금액"])
+hours_period = pd.DataFrame(columns=["기간", "근무시간", "이월수량", "이월금액", "근무인원"])
 if df_hours_all is not None and not df_hours_all.empty:
     dh = df_hours_all.copy()
+    if "근무인원" not in dh.columns:
+        dh["근무인원"] = 0
     dh["기간"] = dh["날짜"].map(lambda d: period_floor(d, period))
     hours_period = dh.groupby("기간", as_index=False).agg(
         근무시간=("근무시간", "sum"),
         이월수량=("이월수량", "sum"),
         이월금액=("이월금액", "sum"),
+        근무인원=("근무인원", "sum"),
     )
 
 final_df = pd.merge(final_df, hours_period, on="기간", how="outer")
-for c in ["계획수량", "계획금액", "실적수량", "실적금액", "근무시간", "이월수량", "이월금액"]:
+for c in ["계획수량", "계획금액", "실적수량", "실적금액", "근무시간", "이월수량", "이월금액", "근무인원"]:
     if c not in final_df.columns:
         final_df[c] = 0
 final_df = final_df.fillna(0).sort_values("기간").reset_index(drop=True)
@@ -620,6 +623,12 @@ final_df["공당생산액"] = np.where(
     final_df["실적금액"] / final_df["근무시간"],
     0,
 )
+# 인당 근무시간 (그 기간 근무시간 합계 / 그 기간 근무인원 합계)
+final_df["인당근무시간"] = np.where(
+    final_df["근무인원"] > 0,
+    final_df["근무시간"] / final_df["근무인원"],
+    0,
+)
 
 # 종합 수치
 total_plan_qty = final_df["계획수량"].sum()
@@ -627,6 +636,7 @@ total_plan_amt = final_df["계획금액"].sum()
 total_actual_qty = final_df["실적수량"].sum()
 total_actual_amt = final_df["실적금액"].sum()
 total_hours = final_df["근무시간"].sum()
+total_workers = final_df["근무인원"].sum()  # 근무인원의 합 (사람-일 단위)
 
 # 이월은 합계가 아닌 "마지막 일자"의 값을 사용 (재고/잔량 의미상)
 if df_hours_all is not None and not df_hours_all.empty:
@@ -638,6 +648,8 @@ else:
     total_carry_amt = 0.0
 
 weighted_productivity = total_actual_amt / total_hours if total_hours > 0 else 0
+# 인당 근무시간: 총 근무시간 / 총 근무인원 (가중평균)
+avg_hours_per_worker = total_hours / total_workers if total_workers > 0 else 0
 qty_rate = (total_actual_qty / total_plan_qty * 100) if total_plan_qty > 0 else 0
 amt_rate = (total_actual_amt / total_plan_amt * 100) if total_plan_amt > 0 else 0
 
@@ -655,12 +667,13 @@ with tab1:
     c3.metric("계획 금액", f"₩{total_plan_amt/1e8:,.2f} 억")
     c4.metric("실적 금액", f"₩{total_actual_amt/1e8:,.2f} 억", f"달성률 {amt_rate:.1f}%")
 
-    # KPI 카드 2열
-    c5, c6, c7, c8 = st.columns(4)
+    # KPI 카드 2열 (5칸)
+    c5, c6, c7, c8, c9 = st.columns(5)
     c5.metric("총 근무시간", f"{total_hours:,.0f} h")
-    c6.metric("공당생산액", f"₩{weighted_productivity:,.0f} /h")
-    c7.metric("이월 수량 (최종일)", f"{total_carry_qty:,.0f} 개")
-    c8.metric("이월 금액 (최종일)", f"₩{total_carry_amt/1e8:,.2f} 억")
+    c6.metric("인당 근무시간", f"{avg_hours_per_worker:,.1f} h/명")
+    c7.metric("공당생산액", f"₩{weighted_productivity:,.0f} /h")
+    c8.metric("이월 수량 (최종일)", f"{total_carry_qty:,.0f} 개")
+    c9.metric("이월 금액 (최종일)", f"₩{total_carry_amt/1e8:,.2f} 억")
 
     st.markdown("<br/>", unsafe_allow_html=True)
 
@@ -745,6 +758,8 @@ with tab1:
                     "실적수량": "{:,.0f}",
                     "실적금액": "₩{:,.0f}",
                     "근무시간": "{:,.0f}",
+                    "근무인원": "{:,.0f}",
+                    "인당근무시간": "{:,.1f}",
                     "공당생산액": "₩{:,.0f}",
                     "이월수량": "{:,.0f}",
                     "이월금액": "₩{:,.0f}",

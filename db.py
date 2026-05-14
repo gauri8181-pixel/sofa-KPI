@@ -59,7 +59,8 @@ SCHEMA_STATEMENTS = [
         날짜 TEXT NOT NULL,
         근무시간 REAL,
         이월수량 REAL,
-        이월금액 REAL
+        이월금액 REAL,
+        근무인원 REAL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_plan_init_date ON production_plan(최초포장계획일)",
     "CREATE INDEX IF NOT EXISTS idx_plan_pack_date ON production_plan(포장계획일)",
@@ -70,21 +71,29 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_upload_team  ON upload_log(team, is_active)",
 ]
 
+# 기존 DB에 컬럼이 없으면 추가 (성공/실패와 무관하게 1회 시도)
+MIGRATIONS = [
+    "ALTER TABLE production_hours ADD COLUMN 근무인원 REAL",
+]
+
 
 # =========================
 # 자격증명
 # =========================
 def _get_turso_creds():
+    url, token = "", ""
     try:
         if "turso" in st.secrets:
-            return (
-                str(st.secrets["turso"].get("url", "")),
-                str(st.secrets["turso"].get("auth_token", "")),
-            )
+            url = str(st.secrets["turso"].get("url", ""))
+            token = str(st.secrets["turso"].get("auth_token", ""))
     except Exception:
         pass
-    url = os.environ.get("TURSO_DATABASE_URL", "")
-    token = os.environ.get("TURSO_AUTH_TOKEN", "")
+    if not (url and token):
+        url = os.environ.get("TURSO_DATABASE_URL", "")
+        token = os.environ.get("TURSO_AUTH_TOKEN", "")
+    # 토큰 양끝의 공백/줄바꿈/따옴표 제거 (Secrets 붙여넣기 시 흔한 오류)
+    token = token.strip().strip('"').strip("'").strip()
+    url = url.strip().strip('"').strip("'").strip()
     return url, token
 
 
@@ -136,9 +145,9 @@ def _execute_pipeline(url: str, token: str, statements: list[tuple]) -> list[dic
     각 statement의 결과를 dict 리스트로 반환
     """
     endpoint = _http_endpoint(url)
-    # 모든 헤더는 ASCII로 강제
+    # 토큰은 이미 _get_turso_creds에서 정리됨, 그대로 사용
     headers = {
-        "Authorization": f"Bearer {token}".encode("ascii", "ignore").decode("ascii"),
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
         "Accept": "application/json",
         "Connection": "close",
@@ -290,11 +299,17 @@ _db_initialized = False
 
 
 def init_db():
-    """스키마 생성 (모듈 레벨 플래그로 1회만 실행)"""
+    """스키마 생성 + 마이그레이션 (모듈 레벨 플래그로 1회만 실행)"""
     global _db_initialized
     if _db_initialized:
         return True
     _exec_many([(stmt, ()) for stmt in SCHEMA_STATEMENTS])
+    # 기존 테이블에 컬럼 추가 시도 (이미 있으면 에러 무시)
+    for migration in MIGRATIONS:
+        try:
+            _exec_one(migration)
+        except Exception:
+            pass
     _db_initialized = True
     return True
 
@@ -391,8 +406,8 @@ def save_upload(
     # 3) production_hours 일괄 INSERT
     if df_hours is not None and not df_hours.empty:
         hours_sql = (
-            "INSERT INTO production_hours (upload_id, 날짜, 근무시간, 이월수량, 이월금액) "
-            "VALUES (?,?,?,?,?)"
+            "INSERT INTO production_hours (upload_id, 날짜, 근무시간, 이월수량, 이월금액, 근무인원) "
+            "VALUES (?,?,?,?,?,?)"
         )
         batch = []
         for _, r in df_hours.iterrows():
@@ -404,6 +419,7 @@ def save_upload(
                     float(r.get("근무시간") or 0),
                     float(r.get("이월수량") or 0),
                     float(r.get("이월금액") or 0),
+                    float(r.get("근무인원") or 0),
                 ),
             ))
         if batch:
@@ -463,7 +479,7 @@ def query_hours(start_date, end_date, team: str = "production") -> pd.DataFrame:
         WHERE u.is_active = 1 AND u.team = ?
           AND h.날짜 BETWEEN ? AND ?
     )
-    SELECT 날짜, 근무시간, 이월수량, 이월금액, upload_id
+    SELECT 날짜, 근무시간, 이월수량, 이월금액, 근무인원, upload_id
     FROM ranked
     WHERE rn = 1
     """
@@ -471,6 +487,10 @@ def query_hours(start_date, end_date, team: str = "production") -> pd.DataFrame:
     df = _result_to_df(res)
     if not df.empty:
         df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce").dt.date
+        if "근무인원" in df.columns:
+            df["근무인원"] = pd.to_numeric(df["근무인원"], errors="coerce").fillna(0)
+        else:
+            df["근무인원"] = 0
     return df
 
 

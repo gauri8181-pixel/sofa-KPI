@@ -670,7 +670,7 @@ with tab1:
     # KPI 카드 2열 (5칸)
     c5, c6, c7, c8, c9 = st.columns(5)
     c5.metric("총 근무시간", f"{total_hours:,.0f} h")
-    c6.metric("인당 근무시간", f"{avg_hours_per_worker:,.1f} h/명")
+    c6.metric("인당 근무시간", f"{avg_hours_per_worker:,.1f} h/일 (조회기간 평균)")
     c7.metric("공당생산액", f"₩{weighted_productivity:,.0f} /h")
     c8.metric("이월 수량 (최종일)", f"{total_carry_qty:,.0f} 개")
     c9.metric("이월 금액 (최종일)", f"₩{total_carry_amt/1e8:,.2f} 억")

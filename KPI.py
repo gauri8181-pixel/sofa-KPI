@@ -572,17 +572,27 @@ if not selected_brands:
 # =========================
 df_filtered = df_all[df_all["브랜드"].isin(selected_brands)].copy()
 
+# 근무일 집합: 근무시간 시트에 날짜가 있는 행만 "근무한 날"로 인정
+# (시트에 없는 날짜는 비근무일 → 모든 집계/차트에서 제외)
+working_dates = None
+if df_hours_all is not None and not df_hours_all.empty:
+    working_dates = set(df_hours_all["날짜"].dropna().tolist())
+
 df_plan = df_filtered.dropna(subset=["최초포장계획일"]).copy()
 df_plan = df_plan[
     (df_plan["최초포장계획일"] >= start_date)
     & (df_plan["최초포장계획일"] <= end_date)
 ]
+if working_dates is not None:
+    df_plan = df_plan[df_plan["최초포장계획일"].isin(working_dates)]
 df_plan["기간"] = df_plan["최초포장계획일"].map(lambda d: period_floor(d, period))
 
 df_actual = df_filtered.dropna(subset=["포장계획일"]).copy()
 df_actual = df_actual[
     (df_actual["포장계획일"] >= start_date) & (df_actual["포장계획일"] <= end_date)
 ]
+if working_dates is not None:
+    df_actual = df_actual[df_actual["포장계획일"].isin(working_dates)]
 df_actual["기간"] = df_actual["포장계획일"].map(lambda d: period_floor(d, period))
 
 if df_plan.empty:

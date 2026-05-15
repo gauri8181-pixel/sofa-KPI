@@ -138,6 +138,17 @@ def _from_hrana_cell(cell):
     return v
 
 
+_http_session = None
+
+
+def _get_http_session():
+    """HTTP 연결 재사용 (TCP/TLS 핸드셰이크 절약)"""
+    global _http_session
+    if _http_session is None:
+        _http_session = requests.Session()
+    return _http_session
+
+
 def _execute_pipeline(url: str, token: str, statements: list[tuple]) -> list[dict]:
     """
     statements: [(sql, params), ...] 형식의 리스트
@@ -150,7 +161,6 @@ def _execute_pipeline(url: str, token: str, statements: list[tuple]) -> list[dic
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
         "Accept": "application/json",
-        "Connection": "close",
     }
     requests_body = []
     for sql, params in statements:
@@ -168,7 +178,7 @@ def _execute_pipeline(url: str, token: str, statements: list[tuple]) -> list[dic
     body_bytes = json.dumps(body, ensure_ascii=True).encode("ascii")
 
     try:
-        r = requests.post(endpoint, headers=headers, data=body_bytes, timeout=60)
+        r = _get_http_session().post(endpoint, headers=headers, data=body_bytes, timeout=60)
     except Exception as e:
         msg = f"Turso 연결 실패: {type(e).__name__}: {e} @ {endpoint}"
         print(f"[TURSO_ERROR] {msg}", flush=True)
@@ -329,6 +339,31 @@ def _date_to_iso(x):
     return str(x)
 
 
+def _build_multi_insert(table: str, columns: list, rows: list) -> list:
+    """
+    여러 행을 한 INSERT 문에 묶어 SQL 파싱 횟수를 줄임.
+    SQLite 파라미터 한도(999) 내에서 자동 분할.
+    """
+    if not rows:
+        return []
+    cols_sql = ",".join(columns)
+    n_cols = len(columns)
+    # 안전 마진을 두어 999 / n_cols 보다 약간 적게
+    max_rows = max(1, 950 // n_cols)
+    placeholder_row = "(" + ",".join(["?"] * n_cols) + ")"
+
+    statements = []
+    for i in range(0, len(rows), max_rows):
+        chunk = rows[i:i + max_rows]
+        all_placeholders = ",".join([placeholder_row] * len(chunk))
+        sql = f"INSERT INTO {table} ({cols_sql}) VALUES {all_placeholders}"
+        flat_params = []
+        for row in chunk:
+            flat_params.extend(row)
+        statements.append((sql, tuple(flat_params)))
+    return statements
+
+
 # =========================
 # 저장
 # =========================
@@ -369,61 +404,52 @@ def save_upload(
         if sel["rows"]:
             upload_id = int(sel["rows"][0][0])
 
-    # 2) production_plan 일괄 INSERT (배치)
+    # 2) production_plan 일괄 INSERT (multi-row VALUES)
     if df_plan is not None and not df_plan.empty:
-        plan_sql = (
-            "INSERT INTO production_plan "
-            "(upload_id, 관리번호, 품목코드, 색상, 단품명칭, 생산라인, 브랜드, "
-            "계획량, 생산량, 입고단가, 계획금액, 실적금액, 최초포장계획일, 포장계획일) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-        )
-        batch = []
+        plan_cols = [
+            "upload_id", "관리번호", "품목코드", "색상", "단품명칭", "생산라인", "브랜드",
+            "계획량", "생산량", "입고단가", "계획금액", "실적금액", "최초포장계획일", "포장계획일",
+        ]
+        plan_rows = []
         for _, r in df_plan.iterrows():
-            batch.append((
-                plan_sql,
-                (
-                    upload_id,
-                    str(r.get("관리번호") or ""),
-                    str(r.get("품목코드") or ""),
-                    str(r.get("색상") or ""),
-                    str(r.get("단품명칭") or ""),
-                    str(r.get("생산라인") or ""),
-                    str(r.get("브랜드") or ""),
-                    float(r.get("계획량") or 0),
-                    float(r.get("생산량") or 0),
-                    float(r.get("입고단가") or 0),
-                    float(r.get("계획금액") or 0),
-                    float(r.get("실적금액") or 0),
-                    _date_to_iso(r.get("최초포장계획일")),
-                    _date_to_iso(r.get("포장계획일")),
-                ),
+            plan_rows.append((
+                upload_id,
+                str(r.get("관리번호") or ""),
+                str(r.get("품목코드") or ""),
+                str(r.get("색상") or ""),
+                str(r.get("단품명칭") or ""),
+                str(r.get("생산라인") or ""),
+                str(r.get("브랜드") or ""),
+                float(r.get("계획량") or 0),
+                float(r.get("생산량") or 0),
+                float(r.get("입고단가") or 0),
+                float(r.get("계획금액") or 0),
+                float(r.get("실적금액") or 0),
+                _date_to_iso(r.get("최초포장계획일")),
+                _date_to_iso(r.get("포장계획일")),
             ))
-        # HTTP 한도/안전을 위해 200행씩 분할
-        CHUNK = 200
-        for i in range(0, len(batch), CHUNK):
-            _exec_many(batch[i:i + CHUNK])
+        plan_statements = _build_multi_insert("production_plan", plan_cols, plan_rows)
+        # HTTP body 크기 제한을 위해 한 HTTP 요청당 multi-INSERT 5개씩 묶어 보냄
+        HTTP_GROUP = 5
+        for i in range(0, len(plan_statements), HTTP_GROUP):
+            _exec_many(plan_statements[i:i + HTTP_GROUP])
 
     # 3) production_hours 일괄 INSERT
     if df_hours is not None and not df_hours.empty:
-        hours_sql = (
-            "INSERT INTO production_hours (upload_id, 날짜, 근무시간, 이월수량, 이월금액, 근무인원) "
-            "VALUES (?,?,?,?,?,?)"
-        )
-        batch = []
+        hours_cols = ["upload_id", "날짜", "근무시간", "이월수량", "이월금액", "근무인원"]
+        hours_rows = []
         for _, r in df_hours.iterrows():
-            batch.append((
-                hours_sql,
-                (
-                    upload_id,
-                    _date_to_iso(r.get("날짜")),
-                    float(r.get("근무시간") or 0),
-                    float(r.get("이월수량") or 0),
-                    float(r.get("이월금액") or 0),
-                    float(r.get("근무인원") or 0),
-                ),
+            hours_rows.append((
+                upload_id,
+                _date_to_iso(r.get("날짜")),
+                float(r.get("근무시간") or 0),
+                float(r.get("이월수량") or 0),
+                float(r.get("이월금액") or 0),
+                float(r.get("근무인원") or 0),
             ))
-        if batch:
-            _exec_many(batch)
+        hours_statements = _build_multi_insert("production_hours", hours_cols, hours_rows)
+        if hours_statements:
+            _exec_many(hours_statements)
 
     return upload_id
 

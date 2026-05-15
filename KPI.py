@@ -521,14 +521,18 @@ if uploaded is not None:
         n_hours = 0 if df_hours_new is None else len(df_hours_new)
         st.sidebar.success(f"파싱 완료 — 생산 {n_plan}행, 근무 {n_hours}행")
         if st.sidebar.button("💾 DB에 저장", use_container_width=True, type="primary"):
-            uid = db.save_upload(
-                team=TEAM,
-                filename=uploaded.name,
-                df_plan=df_plan_new,
-                df_hours=df_hours_new,
-                file_bytes=file_bytes,
-            )
-            st.sidebar.success(f"✅ 저장 완료 (#{uid})")
+            import time as _time
+            _t0 = _time.time()
+            with st.spinner(f"DB에 저장 중... (생산 {n_plan}행, 근무 {n_hours}행)"):
+                uid = db.save_upload(
+                    team=TEAM,
+                    filename=uploaded.name,
+                    df_plan=df_plan_new,
+                    df_hours=df_hours_new,
+                    file_bytes=file_bytes,
+                )
+            elapsed = _time.time() - _t0
+            st.sidebar.success(f"✅ 저장 완료 (#{uid}) — {elapsed:.1f}초")
             st.cache_data.clear()
             st.rerun()
 

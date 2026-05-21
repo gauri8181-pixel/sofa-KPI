@@ -34,7 +34,8 @@ SCHEMA_STATEMENTS = [
         is_active INTEGER DEFAULT 1,
         plan_rows INTEGER DEFAULT 0,
         hours_rows INTEGER DEFAULT 0,
-        note TEXT
+        note TEXT,
+        claims_rows INTEGER DEFAULT 0
     )""",
     """CREATE TABLE IF NOT EXISTS production_plan (
         row_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,18 +63,29 @@ SCHEMA_STATEMENTS = [
         이월금액 REAL,
         근무인원 REAL
     )""",
+    """CREATE TABLE IF NOT EXISTS quality_claims (
+        row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        upload_id INTEGER NOT NULL,
+        날짜 TEXT NOT NULL,
+        브랜드 TEXT NOT NULL,
+        건수 INTEGER NOT NULL
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_plan_init_date ON production_plan(최초포장계획일)",
     "CREATE INDEX IF NOT EXISTS idx_plan_pack_date ON production_plan(포장계획일)",
     "CREATE INDEX IF NOT EXISTS idx_plan_upload  ON production_plan(upload_id)",
     "CREATE INDEX IF NOT EXISTS idx_plan_brand   ON production_plan(브랜드)",
     "CREATE INDEX IF NOT EXISTS idx_hours_date   ON production_hours(날짜)",
     "CREATE INDEX IF NOT EXISTS idx_hours_upload ON production_hours(upload_id)",
+    "CREATE INDEX IF NOT EXISTS idx_claims_date  ON quality_claims(날짜)",
+    "CREATE INDEX IF NOT EXISTS idx_claims_brand ON quality_claims(브랜드)",
+    "CREATE INDEX IF NOT EXISTS idx_claims_upload ON quality_claims(upload_id)",
     "CREATE INDEX IF NOT EXISTS idx_upload_team  ON upload_log(team, is_active)",
 ]
 
 # 기존 DB에 컬럼이 없으면 추가 (성공/실패와 무관하게 1회 시도)
 MIGRATIONS = [
     "ALTER TABLE production_hours ADD COLUMN 근무인원 REAL",
+    "ALTER TABLE upload_log ADD COLUMN claims_rows INTEGER DEFAULT 0",
 ]
 
 
@@ -370,8 +382,9 @@ def _build_multi_insert(table: str, columns: list, rows: list) -> list:
 def save_upload(
     team: str,
     filename: str,
-    df_plan: pd.DataFrame,
-    df_hours: pd.DataFrame | None,
+    df_plan: pd.DataFrame | None = None,
+    df_hours: pd.DataFrame | None = None,
+    df_claims: pd.DataFrame | None = None,
     file_bytes: bytes | None = None,
 ) -> int:
     init_db()
@@ -386,13 +399,14 @@ def save_upload(
         except Exception:
             pass
 
-    plan_n = 0 if df_plan is None else len(df_plan)
-    hours_n = 0 if df_hours is None else len(df_hours)
+    plan_n = 0 if df_plan is None or df_plan.empty else len(df_plan)
+    hours_n = 0 if df_hours is None or df_hours.empty else len(df_hours)
+    claims_n = 0 if df_claims is None or df_claims.empty else len(df_claims)
 
     # 1) upload_log INSERT
     res = _exec_one(
-        "INSERT INTO upload_log (team, filename, plan_rows, hours_rows) VALUES (?, ?, ?, ?)",
-        (team, filename, plan_n, hours_n),
+        "INSERT INTO upload_log (team, filename, plan_rows, hours_rows, claims_rows) VALUES (?, ?, ?, ?, ?)",
+        (team, filename, plan_n, hours_n, claims_n),
     )
     upload_id = res.get("last_insert_rowid")
     if not upload_id:
@@ -451,7 +465,90 @@ def save_upload(
         if hours_statements:
             _exec_many(hours_statements)
 
+    # 4) quality_claims 일괄 INSERT
+    if df_claims is not None and not df_claims.empty:
+        claims_cols = ["upload_id", "날짜", "브랜드", "건수"]
+        claims_rows_data = []
+        for _, r in df_claims.iterrows():
+            claims_rows_data.append((
+                upload_id,
+                _date_to_iso(r.get("날짜")),
+                str(r.get("브랜드") or "").strip(),
+                int(r.get("건수") or 0),
+            ))
+        claims_statements = _build_multi_insert("quality_claims", claims_cols, claims_rows_data)
+        if claims_statements:
+            _exec_many(claims_statements)
+
     return upload_id
+
+
+# =========================
+# 품질팀 조회 함수
+# =========================
+def query_claims(start_date, end_date, team: str = "quality") -> pd.DataFrame:
+    """활성 업로드 + (날짜, 브랜드)별 최신 버전만 반환"""
+    init_db()
+    sql = """
+    WITH ranked AS (
+        SELECT c.*,
+               ROW_NUMBER() OVER (
+                 PARTITION BY c.날짜, c.브랜드
+                 ORDER BY c.upload_id DESC, c.row_id DESC
+               ) AS rn
+        FROM quality_claims c
+        JOIN upload_log u ON c.upload_id = u.upload_id
+        WHERE u.is_active = 1 AND u.team = ?
+          AND c.날짜 BETWEEN ? AND ?
+    )
+    SELECT 날짜, 브랜드, 건수, upload_id
+    FROM ranked
+    WHERE rn = 1
+    """
+    res = _exec_one(sql, (team, _date_to_iso(start_date), _date_to_iso(end_date)))
+    df = _result_to_df(res)
+    if not df.empty:
+        df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce").dt.date
+        df["건수"] = pd.to_numeric(df["건수"], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+def get_claims_brands(team: str = "quality") -> list:
+    init_db()
+    res = _exec_one(
+        """
+        SELECT DISTINCT c.브랜드 AS brand
+        FROM quality_claims c
+        JOIN upload_log u ON c.upload_id = u.upload_id
+        WHERE u.is_active = 1 AND u.team = ? AND c.브랜드 IS NOT NULL
+        """,
+        (team,),
+    )
+    df = _result_to_df(res)
+    if df.empty:
+        return []
+    return sorted([b for b in df["brand"].dropna().tolist() if b])
+
+
+def get_claims_date_range(team: str = "quality"):
+    init_db()
+    res = _exec_one(
+        """
+        SELECT MIN(c.날짜) AS min_d, MAX(c.날짜) AS max_d
+        FROM quality_claims c
+        JOIN upload_log u ON c.upload_id = u.upload_id
+        WHERE u.is_active = 1 AND u.team = ? AND c.날짜 IS NOT NULL
+        """,
+        (team,),
+    )
+    if not res["rows"] or not res["rows"][0][0]:
+        return None, None
+    min_d = pd.to_datetime(res["rows"][0][0], errors="coerce")
+    max_d = pd.to_datetime(res["rows"][0][1], errors="coerce")
+    return (
+        min_d.date() if pd.notna(min_d) else None,
+        max_d.date() if pd.notna(max_d) else None,
+    )
 
 
 # =========================
@@ -548,6 +645,7 @@ def delete_upload(upload_id: int):
     _exec_many([
         ("DELETE FROM production_plan WHERE upload_id = ?", (upload_id,)),
         ("DELETE FROM production_hours WHERE upload_id = ?", (upload_id,)),
+        ("DELETE FROM quality_claims WHERE upload_id = ?", (upload_id,)),
         ("DELETE FROM upload_log WHERE upload_id = ?", (upload_id,)),
     ])
 

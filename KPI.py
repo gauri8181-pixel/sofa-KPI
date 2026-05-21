@@ -26,7 +26,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-TEAM = "production"
+TEAM_OPTIONS = {
+    "🛋️ 생산팀": ("production", "🛋️ 생산팀 KPI 대시보드"),
+    "✅ 품질관리팀": ("quality", "✅ 품질관리팀 KPI 대시보드"),
+}
+# TEAM 변수는 사이드바 선택 후 동적으로 설정됨
 
 # =========================
 # 색상 팔레트 (다크 모드)
@@ -454,30 +458,106 @@ def parse_excel(file_bytes: bytes):
 
 
 # =========================
+# 품질팀 엑셀 파싱 (매트릭스 → long format)
+# =========================
+SHEET_CLAIMS = "클레임건수"
+
+
+def parse_quality_excel(file_bytes: bytes):
+    """
+    품질팀 엑셀:
+      - 시트: 클레임건수
+      - 5행이 헤더 (1열: 브랜드, 나머지 열: 날짜)
+      - 데이터: 각 브랜드 × 날짜 셀에 클레임 건수
+    반환: (df_claims, err)
+      df_claims columns: 날짜, 브랜드, 건수
+    """
+    try:
+        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    except Exception as e:
+        return None, [f"엑셀 파일 열기 실패: {e}"]
+
+    if SHEET_CLAIMS not in xls.sheet_names:
+        return None, [f"필수 시트 '{SHEET_CLAIMS}' 없음"]
+
+    # 헤더는 5번째 행 (0-indexed = 4)
+    df = pd.read_excel(xls, sheet_name=SHEET_CLAIMS, header=4)
+
+    if df.empty or "브랜드" not in df.columns:
+        return None, ["첫 컬럼이 '브랜드'가 아니거나 데이터가 없음"]
+
+    # 브랜드 NaN 행 제거
+    df = df.dropna(subset=["브랜드"]).copy()
+    df["브랜드"] = df["브랜드"].astype(str).str.strip()
+    df = df[df["브랜드"] != ""]
+
+    # 매트릭스 → long format (melt)
+    df_long = df.melt(id_vars=["브랜드"], var_name="날짜", value_name="건수")
+
+    # 날짜 변환 (헤더가 datetime이거나 문자열 둘 다 처리)
+    df_long["날짜"] = pd.to_datetime(df_long["날짜"], errors="coerce").dt.date
+    df_long = df_long.dropna(subset=["날짜"])
+
+    # 건수 변환 (NaN → 0)
+    df_long["건수"] = pd.to_numeric(df_long["건수"], errors="coerce").fillna(0).astype(int)
+
+    # 0 건수는 의미가 없으니 제외 (DB 저장 효율)
+    df_long = df_long[df_long["건수"] > 0].reset_index(drop=True)
+
+    return df_long[["날짜", "브랜드", "건수"]], None
+
+
+# =========================
+# 팀 선택 (사이드바 최상단)
+# =========================
+team_label = st.sidebar.selectbox(
+    "🏢 팀 선택",
+    list(TEAM_OPTIONS.keys()),
+    index=0,
+    key="team_select",
+)
+TEAM, PAGE_TITLE = TEAM_OPTIONS[team_label]
+st.sidebar.markdown("---")
+
+
+# =========================
 # DB 캐시 래퍼
 # =========================
 db.init_db()
 
 
 @st.cache_data
-def load_plan(s, e):
-    return db.query_plan(s, e, team=TEAM)
+def load_plan(team, s, e):
+    return db.query_plan(s, e, team=team)
 
 
 @st.cache_data
-def load_hours(s, e):
-    return db.query_hours(s, e, team=TEAM)
+def load_hours(team, s, e):
+    return db.query_hours(s, e, team=team)
 
 
 @st.cache_data
-def load_brands():
-    return db.get_active_brands(team=TEAM)
+def load_brands(team):
+    return db.get_active_brands(team=team)
+
+
+@st.cache_data
+def load_claims(team, s, e):
+    return db.query_claims(s, e, team=team)
+
+
+@st.cache_data
+def load_claims_brands(team):
+    return db.get_claims_brands(team=team)
 
 
 # =========================
 # 헤더
 # =========================
-data_min, data_max = db.get_data_date_range(TEAM)
+if TEAM == "production":
+    data_min, data_max = db.get_data_date_range(TEAM)
+else:  # quality
+    data_min, data_max = db.get_claims_date_range(TEAM)
 uploads_df = db.list_uploads(team=TEAM)
 n_active = int(uploads_df["is_active"].sum()) if not uploads_df.empty else 0
 n_total = len(uploads_df)
@@ -492,7 +572,7 @@ range_text = (
 st.markdown(
     f"""
 <div class="main-header">
-    <h1>🛋️ 생산팀 KPI 대시보드</h1>
+    <h1>{PAGE_TITLE}</h1>
     <div class="subtitle">
         <span class="status-pill">📊 활성 업로드 {n_active}/{n_total}</span>
         <span class="status-pill">📅 데이터 범위 {range_text}</span>
@@ -504,37 +584,59 @@ st.markdown(
 )
 
 # =========================
-# 사이드바
+# 사이드바 - 업로드
 # =========================
 st.sidebar.header("📂 데이터 업로드")
 uploaded = st.sidebar.file_uploader(
-    "KPI 입력용 파일 (Excel)", type=["xlsx"], key="uploader"
+    "KPI 입력용 파일 (Excel)", type=["xlsx"], key=f"uploader_{TEAM}"
 )
 
 if uploaded is not None:
     file_bytes = uploaded.read()
-    df_plan_new, df_hours_new, err = parse_excel(file_bytes)
-    if err:
-        st.sidebar.error(f"파싱 실패: {err}")
-    else:
-        n_plan = 0 if df_plan_new is None else len(df_plan_new)
-        n_hours = 0 if df_hours_new is None else len(df_hours_new)
-        st.sidebar.success(f"파싱 완료 — 생산 {n_plan}행, 근무 {n_hours}행")
-        if st.sidebar.button("💾 DB에 저장", use_container_width=True, type="primary"):
-            import time as _time
-            _t0 = _time.time()
-            with st.spinner(f"DB에 저장 중... (생산 {n_plan}행, 근무 {n_hours}행)"):
-                uid = db.save_upload(
-                    team=TEAM,
-                    filename=uploaded.name,
-                    df_plan=df_plan_new,
-                    df_hours=df_hours_new,
-                    file_bytes=file_bytes,
-                )
-            elapsed = _time.time() - _t0
-            st.sidebar.success(f"✅ 저장 완료 (#{uid}) — {elapsed:.1f}초")
-            st.cache_data.clear()
-            st.rerun()
+    if TEAM == "production":
+        df_plan_new, df_hours_new, err = parse_excel(file_bytes)
+        if err:
+            st.sidebar.error(f"파싱 실패: {err}")
+        else:
+            n_plan = 0 if df_plan_new is None else len(df_plan_new)
+            n_hours = 0 if df_hours_new is None else len(df_hours_new)
+            st.sidebar.success(f"파싱 완료 — 생산 {n_plan}행, 근무 {n_hours}행")
+            if st.sidebar.button("💾 DB에 저장", use_container_width=True, type="primary"):
+                import time as _time
+                _t0 = _time.time()
+                with st.spinner(f"DB에 저장 중... (생산 {n_plan}행, 근무 {n_hours}행)"):
+                    uid = db.save_upload(
+                        team=TEAM,
+                        filename=uploaded.name,
+                        df_plan=df_plan_new,
+                        df_hours=df_hours_new,
+                        file_bytes=file_bytes,
+                    )
+                elapsed = _time.time() - _t0
+                st.sidebar.success(f"✅ 저장 완료 (#{uid}) — {elapsed:.1f}초")
+                st.cache_data.clear()
+                st.rerun()
+    else:  # quality
+        df_claims_new, err = parse_quality_excel(file_bytes)
+        if err:
+            st.sidebar.error(f"파싱 실패: {err}")
+        else:
+            n_claims = 0 if df_claims_new is None else len(df_claims_new)
+            st.sidebar.success(f"파싱 완료 — 클레임 {n_claims}건")
+            if st.sidebar.button("💾 DB에 저장", use_container_width=True, type="primary"):
+                import time as _time
+                _t0 = _time.time()
+                with st.spinner(f"DB에 저장 중... (클레임 {n_claims}건)"):
+                    uid = db.save_upload(
+                        team=TEAM,
+                        filename=uploaded.name,
+                        df_claims=df_claims_new,
+                        file_bytes=file_bytes,
+                    )
+                elapsed = _time.time() - _t0
+                st.sidebar.success(f"✅ 저장 완료 (#{uid}) — {elapsed:.1f}초")
+                st.cache_data.clear()
+                st.rerun()
 
 st.sidebar.header("📅 조회 기간")
 default_start = data_min if data_min else date(2026, 4, 1)
@@ -549,11 +651,23 @@ if start_date > end_date:
     st.error("시작일이 종료일보다 늦습니다.")
     st.stop()
 
-df_all = load_plan(start_date, end_date)
-df_hours_all = load_hours(start_date, end_date)
-brand_list = load_brands()
+if TEAM == "production":
+    df_all = load_plan(TEAM, start_date, end_date)
+    df_hours_all = load_hours(TEAM, start_date, end_date)
+    brand_list = load_brands(TEAM)
+    df_claims_all = pd.DataFrame()
+else:  # quality
+    df_all = pd.DataFrame()
+    df_hours_all = pd.DataFrame()
+    df_claims_all = load_claims(TEAM, start_date, end_date)
+    brand_list = load_claims_brands(TEAM)
 
-if df_all.empty and df_hours_all.empty:
+# 데이터 없을 시 안내
+has_data = (
+    (TEAM == "production" and (not df_all.empty or not df_hours_all.empty))
+    or (TEAM == "quality" and not df_claims_all.empty)
+)
+if not has_data:
     st.info("📭 저장된 데이터가 없습니다. 사이드바에서 엑셀을 업로드하고 **DB에 저장**을 눌러주세요.")
     st.stop()
 
@@ -561,11 +675,178 @@ st.sidebar.header("🏷️ 브랜드 필터")
 selected_brands = st.sidebar.multiselect(
     "브랜드 선택", brand_list, default=brand_list, label_visibility="collapsed"
 )
-st.sidebar.caption("ℹ️ 근무시간/이월은 브랜드 무관 전체값")
+if TEAM == "production":
+    st.sidebar.caption("ℹ️ 근무시간/이월은 브랜드 무관 전체값")
 
 if not selected_brands:
     st.warning("브랜드를 1개 이상 선택해주세요.")
     st.stop()
+
+# =========================
+# 품질팀 대시보드 (분기) — 출력 후 st.stop()으로 production 코드 차단
+# =========================
+if TEAM == "quality":
+    # 데이터 필터링
+    dfq = df_claims_all[df_claims_all["브랜드"].isin(selected_brands)].copy()
+    dfq = dfq[(dfq["날짜"] >= start_date) & (dfq["날짜"] <= end_date)]
+    dfq["기간"] = dfq["날짜"].map(lambda d: period_floor(d, period))
+
+    # 종합 지표
+    total_claims = int(dfq["건수"].sum())
+    n_days = dfq["날짜"].nunique()
+    avg_claims_per_day = total_claims / n_days if n_days > 0 else 0
+    top_brand_row = (
+        dfq.groupby("브랜드")["건수"].sum().sort_values(ascending=False)
+        if not dfq.empty else None
+    )
+    top_brand_name = top_brand_row.index[0] if top_brand_row is not None and len(top_brand_row) > 0 else "-"
+    top_brand_count = int(top_brand_row.iloc[0]) if top_brand_row is not None and len(top_brand_row) > 0 else 0
+
+    # 기간별 집계
+    period_total = (
+        dfq.groupby("기간", as_index=False)["건수"].sum()
+        if not dfq.empty else pd.DataFrame(columns=["기간", "건수"])
+    )
+    # 기간×브랜드 집계 (stacked)
+    period_brand = (
+        dfq.groupby(["기간", "브랜드"], as_index=False)["건수"].sum()
+        if not dfq.empty else pd.DataFrame(columns=["기간", "브랜드", "건수"])
+    )
+
+    # 탭
+    tab1, tab2, tab3 = st.tabs(["📊  종합 대시보드", "🏷️  브랜드 분석", "📜  업로드 이력"])
+
+    # ---------- 종합 ----------
+    with tab1:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("총 클레임", f"{total_claims:,} 건")
+        c2.metric("일평균 클레임", f"{avg_claims_per_day:.1f} 건/일")
+        c3.metric("최다 브랜드", f"{top_brand_name}")
+        c4.metric("최다 건수", f"{top_brand_count:,} 건")
+
+        st.markdown("<br/>", unsafe_allow_html=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"##### 📈 {period} 클레임 추이 (총합)")
+            if not period_total.empty:
+                fig = px.bar(
+                    period_total, x="기간", y="건수",
+                    text_auto=True,
+                    color_discrete_sequence=[COLOR_PRIMARY],
+                )
+                fig.update_layout(yaxis_title="클레임 건수", xaxis_title=None)
+                st.plotly_chart(style_fig(fig), use_container_width=True)
+            else:
+                st.info("표시할 데이터 없음")
+
+        with col2:
+            st.markdown(f"##### 📊 {period} 브랜드별 누적 추이")
+            if not period_brand.empty:
+                fig = px.bar(
+                    period_brand, x="기간", y="건수", color="브랜드",
+                    barmode="stack", text_auto=True,
+                    color_discrete_map=BRAND_COLORS,
+                )
+                fig.update_layout(yaxis_title="클레임 건수", xaxis_title=None)
+                st.plotly_chart(style_fig(fig), use_container_width=True)
+            else:
+                st.info("표시할 데이터 없음")
+
+        with st.expander("🔍 기간별 상세 데이터"):
+            st.dataframe(period_total, use_container_width=True, hide_index=True)
+
+    # ---------- 브랜드 분석 ----------
+    with tab2:
+        brand_summary = (
+            dfq.groupby("브랜드", as_index=False)["건수"].sum()
+            .sort_values("건수", ascending=False).reset_index(drop=True)
+            if not dfq.empty else pd.DataFrame(columns=["브랜드", "건수"])
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("##### 🥧 브랜드별 클레임 비중")
+            pie_df = brand_summary[brand_summary["건수"] > 0]
+            if not pie_df.empty:
+                fig_pie = px.pie(
+                    pie_df, values="건수", names="브랜드",
+                    color="브랜드", color_discrete_map=BRAND_COLORS, hole=0.45,
+                )
+                fig_pie.update_traces(textposition="outside", textinfo="percent+label")
+                st.plotly_chart(style_fig(fig_pie), use_container_width=True)
+            else:
+                st.info("실적 데이터 없음")
+
+        with col_b:
+            st.markdown("##### 📊 브랜드별 총 클레임")
+            if not brand_summary.empty:
+                fig_bar = px.bar(
+                    brand_summary, x="브랜드", y="건수", text_auto=True,
+                    color="브랜드", color_discrete_map=BRAND_COLORS,
+                )
+                fig_bar.update_layout(yaxis_title="클레임 건수", xaxis_title=None, showlegend=False)
+                st.plotly_chart(style_fig(fig_bar), use_container_width=True)
+            else:
+                st.info("데이터 없음")
+
+        # 합계 행 추가
+        if not brand_summary.empty:
+            total_row = pd.DataFrame([{"브랜드": "합계", "건수": total_claims}])
+            brand_summary_disp = pd.concat([brand_summary, total_row], ignore_index=True)
+        else:
+            brand_summary_disp = brand_summary
+
+        st.markdown("##### 📋 브랜드별 상세")
+        st.dataframe(
+            brand_summary_disp.style.format({"건수": "{:,.0f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # ---------- 업로드 이력 ----------
+    with tab3:
+        uploads = db.list_uploads(team=TEAM)
+        if uploads.empty:
+            st.info("업로드 이력이 없습니다.")
+        else:
+            st.caption("**비활성화**: 데이터에서 제외 (복구 가능) / **영구삭제**: DB에서 제거")
+            header = st.columns([1, 3, 2, 2, 1, 1, 1])
+            header[0].markdown("**ID**")
+            header[1].markdown("**파일명**")
+            header[2].markdown("**업로드 일시**")
+            header[3].markdown("**건수**")
+            header[4].markdown("**상태**")
+            header[5].markdown("**토글**")
+            header[6].markdown("**삭제**")
+            st.markdown("---")
+            for _, row in uploads.iterrows():
+                uid = int(row["upload_id"])
+                active = bool(row["is_active"])
+                claims_rows = int(row["claims_rows"]) if "claims_rows" in row.index and pd.notna(row.get("claims_rows")) else 0
+                cols = st.columns([1, 3, 2, 2, 1, 1, 1])
+                cols[0].write(f"#{uid}")
+                cols[1].write(row["filename"] or "-")
+                cols[2].write(row["uploaded_at"])
+                cols[3].write(f"C:{claims_rows}")
+                if active:
+                    cols[4].markdown(f"<span style='color:{COLOR_SUCCESS};font-weight:600;'>● 활성</span>", unsafe_allow_html=True)
+                    if cols[5].button("비활성", key=f"q_deact_{uid}"):
+                        db.set_upload_active(uid, False)
+                        st.cache_data.clear()
+                        st.rerun()
+                else:
+                    cols[4].markdown(f"<span style='color:{COLOR_MUTED};font-weight:600;'>○ 비활성</span>", unsafe_allow_html=True)
+                    if cols[5].button("복구", key=f"q_act_{uid}"):
+                        db.set_upload_active(uid, True)
+                        st.cache_data.clear()
+                        st.rerun()
+                if cols[6].button("🗑️", key=f"q_del_{uid}"):
+                    db.delete_upload(uid)
+                    st.cache_data.clear()
+                    st.rerun()
+
+    st.stop()  # 품질팀 대시보드 출력 후 production 코드 실행 차단
 
 # =========================
 # 계산

@@ -458,53 +458,68 @@ def parse_excel(file_bytes: bytes):
 
 
 # =========================
-# 품질팀 엑셀 파싱 (매트릭스 → long format)
+# 품질팀 엑셀 파싱 (트랜잭션 로그)
 # =========================
-SHEET_CLAIMS = "클레임건수"
+# 새 양식: 각 행 = 1건의 클레임
+# 컬럼: 월, 날짜(텍스트 "1월 1일"), 브랜드, 업체, 상품/제품, 대분류, 소분류, 품목
+QUALITY_YEAR = 2026  # 날짜의 연도 (파일에 연도 없음)
+
+_KOR_DATE_RE = re.compile(r"(\d+)\s*월\s*(\d+)\s*일")
+
+
+def _parse_korean_date(s, year: int = QUALITY_YEAR):
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return None
+    s = str(s).strip()
+    m = _KOR_DATE_RE.match(s)
+    if not m:
+        return None
+    try:
+        return date(year, int(m.group(1)), int(m.group(2)))
+    except ValueError:
+        return None
 
 
 def parse_quality_excel(file_bytes: bytes):
     """
-    품질팀 엑셀:
-      - 시트: 클레임건수
-      - 5행이 헤더 (1열: 브랜드, 나머지 열: 날짜)
-      - 데이터: 각 브랜드 × 날짜 셀에 클레임 건수
+    새 양식: 첫 시트, 헤더 첫 행
+    컬럼: 월, 날짜, 브랜드, 업체, 상품/제품, 대분류, 소분류, 품목
     반환: (df_claims, err)
-      df_claims columns: 날짜, 브랜드, 건수
+      df_claims columns: 날짜, 월, 브랜드, 업체, 상품제품, 대분류, 소분류, 품목
     """
     try:
         xls = pd.ExcelFile(io.BytesIO(file_bytes))
     except Exception as e:
         return None, [f"엑셀 파일 열기 실패: {e}"]
 
-    if SHEET_CLAIMS not in xls.sheet_names:
-        return None, [f"필수 시트 '{SHEET_CLAIMS}' 없음"]
+    if not xls.sheet_names:
+        return None, ["시트가 없는 파일"]
 
-    # 헤더는 5번째 행 (0-indexed = 4)
-    df = pd.read_excel(xls, sheet_name=SHEET_CLAIMS, header=4)
+    sheet_name = xls.sheet_names[0]
+    try:
+        df = pd.read_excel(xls, sheet_name=sheet_name, header=0)
+    except Exception as e:
+        return None, [f"시트 읽기 실패: {e}"]
 
-    if df.empty or "브랜드" not in df.columns:
-        return None, ["첫 컬럼이 '브랜드'가 아니거나 데이터가 없음"]
+    required = ["월", "날짜", "브랜드", "업체", "상품/제품", "대분류", "소분류", "품목"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return None, [f"필수 컬럼 누락: {missing}"]
 
-    # 브랜드 NaN 행 제거
-    df = df.dropna(subset=["브랜드"]).copy()
-    df["브랜드"] = df["브랜드"].astype(str).str.strip()
-    df = df[df["브랜드"] != ""]
+    # 날짜 텍스트 → date(연도=QUALITY_YEAR)
+    df["날짜"] = df["날짜"].apply(_parse_korean_date)
+    df = df.dropna(subset=["날짜"]).copy()
 
-    # 매트릭스 → long format (melt)
-    df_long = df.melt(id_vars=["브랜드"], var_name="날짜", value_name="건수")
+    # 문자열 컬럼 정규화
+    for c in ["월", "브랜드", "업체", "상품/제품", "대분류", "소분류", "품목"]:
+        df[c] = df[c].fillna("").astype(str).str.strip()
 
-    # 날짜 변환 (헤더가 datetime이거나 문자열 둘 다 처리)
-    df_long["날짜"] = pd.to_datetime(df_long["날짜"], errors="coerce").dt.date
-    df_long = df_long.dropna(subset=["날짜"])
+    # DB 컬럼명 호환 위해 슬래시 제거
+    df = df.rename(columns={"상품/제품": "상품제품"})
 
-    # 건수 변환 (NaN → 0)
-    df_long["건수"] = pd.to_numeric(df_long["건수"], errors="coerce").fillna(0).astype(int)
-
-    # 0 건수는 의미가 없으니 제외 (DB 저장 효율)
-    df_long = df_long[df_long["건수"] > 0].reset_index(drop=True)
-
-    return df_long[["날짜", "브랜드", "건수"]], None
+    return df[
+        ["날짜", "월", "브랜드", "업체", "상품제품", "대분류", "소분류", "품목"]
+    ].reset_index(drop=True), None
 
 
 # =========================
@@ -682,143 +697,339 @@ if not selected_brands:
     st.warning("브랜드를 1개 이상 선택해주세요.")
     st.stop()
 
+# 품질팀 전용 추가 필터
+sel_vendors = None
+sel_categories = None
+sel_product_type = None
+if TEAM == "quality" and not df_claims_all.empty:
+    st.sidebar.header("🔎 추가 필터")
+    vendor_list = sorted([v for v in df_claims_all["업체"].dropna().unique().tolist() if v])
+    cat_list = sorted([v for v in df_claims_all["대분류"].dropna().unique().tolist() if v])
+    ptype_list = sorted([v for v in df_claims_all["상품제품"].dropna().unique().tolist() if v])
+
+    sel_vendors = st.sidebar.multiselect("업체", vendor_list, default=vendor_list)
+    sel_categories = st.sidebar.multiselect("대분류", cat_list, default=cat_list)
+    sel_product_type = st.sidebar.multiselect("상품/제품", ptype_list, default=ptype_list)
+
 # =========================
 # 품질팀 대시보드 (분기) — 출력 후 st.stop()으로 production 코드 차단
 # =========================
 if TEAM == "quality":
-    # 데이터 필터링
+    # === 필터링 (브랜드 + 추가 필터) ===
     dfq = df_claims_all[df_claims_all["브랜드"].isin(selected_brands)].copy()
+    if sel_vendors:
+        dfq = dfq[dfq["업체"].isin(sel_vendors)]
+    if sel_categories:
+        dfq = dfq[dfq["대분류"].isin(sel_categories)]
+    if sel_product_type:
+        dfq = dfq[dfq["상품제품"].isin(sel_product_type)]
     dfq = dfq[(dfq["날짜"] >= start_date) & (dfq["날짜"] <= end_date)]
     dfq["기간"] = dfq["날짜"].map(lambda d: period_floor(d, period))
 
-    # 종합 지표
-    total_claims = int(dfq["건수"].sum())
-    n_days = dfq["날짜"].nunique()
+    # === 생산 실적 로드 (하자율 계산용) ===
+    try:
+        df_prod = db.query_plan(start_date, end_date, team="production")
+    except Exception:
+        df_prod = pd.DataFrame()
+    if not df_prod.empty:
+        df_prod_actual = df_prod.dropna(subset=["포장계획일"]).copy()
+        df_prod_actual = df_prod_actual[
+            (df_prod_actual["포장계획일"] >= start_date)
+            & (df_prod_actual["포장계획일"] <= end_date)
+        ]
+        # 같은 브랜드 필터 적용 (선택된 브랜드만)
+        df_prod_actual = df_prod_actual[df_prod_actual["브랜드"].isin(selected_brands)]
+        df_prod_actual["기간"] = df_prod_actual["포장계획일"].map(lambda d: period_floor(d, period))
+    else:
+        df_prod_actual = pd.DataFrame(columns=["브랜드", "생산량", "포장계획일", "기간"])
+
+    # === 종합 지표 ===
+    total_claims = len(dfq)
+    total_production = float(df_prod_actual["생산량"].sum()) if not df_prod_actual.empty else 0.0
+    total_defect_rate = (total_claims / total_production * 100) if total_production > 0 else 0.0
+    n_days = dfq["날짜"].nunique() if not dfq.empty else 0
     avg_claims_per_day = total_claims / n_days if n_days > 0 else 0
-    top_brand_row = (
-        dfq.groupby("브랜드")["건수"].sum().sort_values(ascending=False)
-        if not dfq.empty else None
-    )
-    top_brand_name = top_brand_row.index[0] if top_brand_row is not None and len(top_brand_row) > 0 else "-"
-    top_brand_count = int(top_brand_row.iloc[0]) if top_brand_row is not None and len(top_brand_row) > 0 else 0
 
-    # 기간별 집계
-    period_total = (
-        dfq.groupby("기간", as_index=False)["건수"].sum()
-        if not dfq.empty else pd.DataFrame(columns=["기간", "건수"])
+    # 최다 브랜드 / 최다 원인
+    top_brand = (
+        dfq["브랜드"].value_counts().head(1)
+        if not dfq.empty else pd.Series(dtype=int)
     )
-    # 기간×브랜드 집계 (stacked)
-    period_brand = (
-        dfq.groupby(["기간", "브랜드"], as_index=False)["건수"].sum()
-        if not dfq.empty else pd.DataFrame(columns=["기간", "브랜드", "건수"])
+    top_brand_name = top_brand.index[0] if len(top_brand) > 0 else "-"
+    top_brand_count = int(top_brand.iloc[0]) if len(top_brand) > 0 else 0
+    top_cause = (
+        dfq["소분류"].value_counts().head(1)
+        if not dfq.empty else pd.Series(dtype=int)
     )
+    top_cause_name = top_cause.index[0] if len(top_cause) > 0 else "-"
 
-    # 탭
-    tab1, tab2, tab3 = st.tabs(["📊  종합 대시보드", "🏷️  브랜드 분석", "📜  업로드 이력"])
+    # === 기간별 집계 (건수 + 하자율) ===
+    period_claims = (
+        dfq.groupby("기간").size().reset_index(name="클레임건수")
+        if not dfq.empty else pd.DataFrame(columns=["기간", "클레임건수"])
+    )
+    period_prod = (
+        df_prod_actual.groupby("기간", as_index=False)["생산량"].sum().rename(columns={"생산량": "실적수량"})
+        if not df_prod_actual.empty else pd.DataFrame(columns=["기간", "실적수량"])
+    )
+    period_summary = pd.merge(period_claims, period_prod, on="기간", how="outer").fillna(0)
+    if not period_summary.empty:
+        period_summary["하자율(%)"] = np.where(
+            period_summary["실적수량"] > 0,
+            period_summary["클레임건수"] / period_summary["실적수량"] * 100,
+            0,
+        )
+        period_summary = period_summary.sort_values("기간").reset_index(drop=True)
 
-    # ---------- 종합 ----------
+    # === 브랜드별 집계 (건수 + 하자율) ===
+    brand_claims = (
+        dfq.groupby("브랜드").size().reset_index(name="클레임건수")
+        if not dfq.empty else pd.DataFrame(columns=["브랜드", "클레임건수"])
+    )
+    brand_prod = (
+        df_prod_actual.groupby("브랜드", as_index=False)["생산량"].sum().rename(columns={"생산량": "실적수량"})
+        if not df_prod_actual.empty else pd.DataFrame(columns=["브랜드", "실적수량"])
+    )
+    brand_summary = pd.merge(brand_claims, brand_prod, on="브랜드", how="outer").fillna(0)
+    if not brand_summary.empty:
+        brand_summary["하자율(%)"] = np.where(
+            brand_summary["실적수량"] > 0,
+            brand_summary["클레임건수"] / brand_summary["실적수량"] * 100,
+            0,
+        )
+        brand_summary = brand_summary.sort_values("클레임건수", ascending=False).reset_index(drop=True)
+
+    # ===========================
+    # 탭 레이아웃
+    # ===========================
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📊  종합 대시보드",
+        "🔬  원인 분석",
+        "🏢  업체/품목 분석",
+        "📜  업로드 이력",
+    ])
+
+    # ---------- 탭1: 종합 ----------
     with tab1:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("총 클레임", f"{total_claims:,} 건")
-        c2.metric("일평균 클레임", f"{avg_claims_per_day:.1f} 건/일")
-        c3.metric("최다 브랜드", f"{top_brand_name}")
-        c4.metric("최다 건수", f"{top_brand_count:,} 건")
+        c2.metric("전체 하자율", f"{total_defect_rate:.2f} %",
+                  help="클레임 건수 ÷ 생산팀 실적수량")
+        c3.metric("최다 브랜드", f"{top_brand_name}", f"{top_brand_count:,} 건")
+        c4.metric("최다 원인", f"{top_cause_name}")
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("총 실적수량", f"{total_production:,.0f} 개")
+        c6.metric("일평균 클레임", f"{avg_claims_per_day:.1f} 건/일")
+        c7.metric("조회 일수", f"{n_days} 일")
+        c8.metric("필터링 브랜드", f"{len(selected_brands)} 개")
 
         st.markdown("<br/>", unsafe_allow_html=True)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown(f"##### 📈 {period} 클레임 추이 (총합)")
-            if not period_total.empty:
-                fig = px.bar(
-                    period_total, x="기간", y="건수",
-                    text_auto=True,
-                    color_discrete_sequence=[COLOR_PRIMARY],
-                )
-                fig.update_layout(yaxis_title="클레임 건수", xaxis_title=None)
-                st.plotly_chart(style_fig(fig), use_container_width=True)
-            else:
-                st.info("표시할 데이터 없음")
+        # 기간 추이 (건수 bar + 하자율 line, 이중 축)
+        st.markdown(f"##### 📈 {period} 클레임 건수 + 하자율 추이")
+        if not period_summary.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=period_summary["기간"], y=period_summary["클레임건수"],
+                name="클레임 건수", marker_color=COLOR_PRIMARY,
+                text=period_summary["클레임건수"], textposition="outside",
+            ))
+            fig.add_trace(go.Scatter(
+                x=period_summary["기간"], y=period_summary["하자율(%)"],
+                name="하자율(%)", mode="lines+markers",
+                line=dict(color=COLOR_ACCENT, width=3),
+                marker=dict(size=8),
+                yaxis="y2",
+            ))
+            fig.update_layout(
+                yaxis=dict(title="클레임 건수"),
+                yaxis2=dict(title="하자율(%)", overlaying="y", side="right",
+                            tickfont=dict(color="#FFFFFF"), title_font=dict(color="#FFFFFF")),
+                xaxis_title=None,
+            )
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+        else:
+            st.info("표시할 데이터 없음")
 
-        with col2:
-            st.markdown(f"##### 📊 {period} 브랜드별 누적 추이")
-            if not period_brand.empty:
-                fig = px.bar(
-                    period_brand, x="기간", y="건수", color="브랜드",
-                    barmode="stack", text_auto=True,
-                    color_discrete_map=BRAND_COLORS,
-                )
-                fig.update_layout(yaxis_title="클레임 건수", xaxis_title=None)
-                st.plotly_chart(style_fig(fig), use_container_width=True)
-            else:
-                st.info("표시할 데이터 없음")
-
-        with st.expander("🔍 기간별 상세 데이터"):
-            st.dataframe(period_total, use_container_width=True, hide_index=True)
-
-    # ---------- 브랜드 분석 ----------
-    with tab2:
-        brand_summary = (
-            dfq.groupby("브랜드", as_index=False)["건수"].sum()
-            .sort_values("건수", ascending=False).reset_index(drop=True)
-            if not dfq.empty else pd.DataFrame(columns=["브랜드", "건수"])
-        )
-
+        # 브랜드별 (건수 + 하자율)
+        st.markdown(f"##### 🏷️ 브랜드별 건수 + 하자율")
         col_a, col_b = st.columns(2)
         with col_a:
-            st.markdown("##### 🥧 브랜드별 클레임 비중")
-            pie_df = brand_summary[brand_summary["건수"] > 0]
-            if not pie_df.empty:
+            if not brand_summary.empty:
+                fig_b = go.Figure()
+                fig_b.add_trace(go.Bar(
+                    x=brand_summary["브랜드"], y=brand_summary["클레임건수"],
+                    name="클레임 건수", marker_color=COLOR_PRIMARY,
+                    text=brand_summary["클레임건수"], textposition="outside",
+                ))
+                fig_b.add_trace(go.Scatter(
+                    x=brand_summary["브랜드"], y=brand_summary["하자율(%)"],
+                    name="하자율(%)", mode="markers+lines",
+                    line=dict(color=COLOR_ACCENT, width=2, dash="dot"),
+                    marker=dict(size=10),
+                    yaxis="y2",
+                ))
+                fig_b.update_layout(
+                    yaxis=dict(title="클레임 건수"),
+                    yaxis2=dict(title="하자율(%)", overlaying="y", side="right",
+                                tickfont=dict(color="#FFFFFF"), title_font=dict(color="#FFFFFF")),
+                    xaxis_title=None,
+                )
+                st.plotly_chart(style_fig(fig_b), use_container_width=True)
+            else:
+                st.info("데이터 없음")
+        with col_b:
+            if not brand_summary.empty and brand_summary["클레임건수"].sum() > 0:
                 fig_pie = px.pie(
-                    pie_df, values="건수", names="브랜드",
-                    color="브랜드", color_discrete_map=BRAND_COLORS, hole=0.45,
+                    brand_summary[brand_summary["클레임건수"] > 0],
+                    values="클레임건수", names="브랜드", hole=0.45,
+                    color="브랜드", color_discrete_map=BRAND_COLORS,
                 )
                 fig_pie.update_traces(textposition="outside", textinfo="percent+label")
                 st.plotly_chart(style_fig(fig_pie), use_container_width=True)
             else:
-                st.info("실적 데이터 없음")
+                st.info("데이터 없음")
 
-        with col_b:
-            st.markdown("##### 📊 브랜드별 총 클레임")
-            if not brand_summary.empty:
-                fig_bar = px.bar(
-                    brand_summary, x="브랜드", y="건수", text_auto=True,
-                    color="브랜드", color_discrete_map=BRAND_COLORS,
-                )
-                fig_bar.update_layout(yaxis_title="클레임 건수", xaxis_title=None, showlegend=False)
-                st.plotly_chart(style_fig(fig_bar), use_container_width=True)
+        st.markdown("##### 📋 브랜드별 상세")
+        if not brand_summary.empty:
+            bs_disp = brand_summary[["브랜드", "클레임건수", "실적수량", "하자율(%)"]].copy()
+            total_row = pd.DataFrame([{
+                "브랜드": "합계",
+                "클레임건수": total_claims,
+                "실적수량": total_production,
+                "하자율(%)": total_defect_rate,
+            }])
+            bs_disp = pd.concat([bs_disp, total_row], ignore_index=True)
+            st.dataframe(
+                bs_disp.style.format({
+                    "클레임건수": "{:,.0f}",
+                    "실적수량": "{:,.0f}",
+                    "하자율(%)": "{:.2f}",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+    # ---------- 탭2: 원인 분석 ----------
+    with tab2:
+        cat_counts = (
+            dfq["대분류"].value_counts().reset_index()
+            if not dfq.empty else pd.DataFrame(columns=["대분류", "count"])
+        )
+        cat_counts.columns = ["대분류", "건수"]
+        sub_counts = (
+            dfq["소분류"].value_counts().reset_index()
+            if not dfq.empty else pd.DataFrame(columns=["소분류", "count"])
+        )
+        sub_counts.columns = ["소분류", "건수"]
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("##### 🥧 대분류 비중")
+            if not cat_counts.empty:
+                fig = px.pie(cat_counts, values="건수", names="대분류", hole=0.45)
+                fig.update_traces(textposition="outside", textinfo="percent+label+value")
+                st.plotly_chart(style_fig(fig), use_container_width=True)
+            else:
+                st.info("데이터 없음")
+        with col2:
+            st.markdown("##### 📊 소분류 Top 10")
+            if not sub_counts.empty:
+                top_sub = sub_counts.head(10)
+                fig = px.bar(top_sub.sort_values("건수"),
+                             x="건수", y="소분류", orientation="h",
+                             text_auto=True,
+                             color_discrete_sequence=[COLOR_ACCENT])
+                fig.update_layout(yaxis_title=None, xaxis_title="건수")
+                st.plotly_chart(style_fig(fig), use_container_width=True)
             else:
                 st.info("데이터 없음")
 
-        # 합계 행 추가
-        if not brand_summary.empty:
-            total_row = pd.DataFrame([{"브랜드": "합계", "건수": total_claims}])
-            brand_summary_disp = pd.concat([brand_summary, total_row], ignore_index=True)
+        st.markdown("##### 🔥 브랜드 × 대분류 매트릭스")
+        if not dfq.empty:
+            matrix = dfq.groupby(["브랜드", "대분류"]).size().reset_index(name="건수")
+            fig = px.density_heatmap(
+                matrix, x="대분류", y="브랜드", z="건수",
+                text_auto=True, color_continuous_scale="Cividis",
+            )
+            fig.update_layout(xaxis_title=None, yaxis_title=None)
+            st.plotly_chart(style_fig(fig), use_container_width=True)
         else:
-            brand_summary_disp = brand_summary
+            st.info("데이터 없음")
 
-        st.markdown("##### 📋 브랜드별 상세")
-        st.dataframe(
-            brand_summary_disp.style.format({"건수": "{:,.0f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
+        with st.expander("🔍 소분류 전체 목록"):
+            st.dataframe(sub_counts, use_container_width=True, hide_index=True)
 
-    # ---------- 업로드 이력 ----------
+    # ---------- 탭3: 업체/품목 분석 ----------
     with tab3:
+        vendor_counts = (
+            dfq["업체"].value_counts().reset_index()
+            if not dfq.empty else pd.DataFrame(columns=["업체", "count"])
+        )
+        vendor_counts.columns = ["업체", "건수"]
+        item_counts = (
+            dfq["품목"].value_counts().reset_index()
+            if not dfq.empty else pd.DataFrame(columns=["품목", "count"])
+        )
+        item_counts.columns = ["품목", "건수"]
+        ptype_counts = (
+            dfq["상품제품"].value_counts().reset_index()
+            if not dfq.empty else pd.DataFrame(columns=["상품제품", "count"])
+        )
+        ptype_counts.columns = ["상품제품", "건수"]
+
+        st.markdown("##### 🏢 업체별 클레임 Top 10")
+        col1, col2 = st.columns(2)
+        with col1:
+            if not vendor_counts.empty:
+                top_v = vendor_counts.head(10)
+                fig = px.bar(top_v.sort_values("건수"),
+                             x="건수", y="업체", orientation="h",
+                             text_auto=True, color_discrete_sequence=[COLOR_PRIMARY])
+                fig.update_layout(yaxis_title=None, xaxis_title="건수")
+                st.plotly_chart(style_fig(fig), use_container_width=True)
+            else:
+                st.info("데이터 없음")
+        with col2:
+            st.markdown("##### 📦 상품 vs 제품")
+            if not ptype_counts.empty:
+                fig = px.pie(ptype_counts, values="건수", names="상품제품", hole=0.45,
+                             color_discrete_sequence=[COLOR_PRIMARY, COLOR_ACCENT])
+                fig.update_traces(textposition="outside", textinfo="percent+label+value")
+                st.plotly_chart(style_fig(fig), use_container_width=True)
+            else:
+                st.info("데이터 없음")
+
+        # 품목 Top N
+        st.markdown("##### 🛋️ 품목 Top N")
+        top_n = st.slider("Top N 개수", 5, 30, 10, key="top_n_items")
+        if not item_counts.empty:
+            top_items = item_counts.head(top_n)
+            fig = px.bar(top_items.sort_values("건수"),
+                         x="건수", y="품목", orientation="h",
+                         text_auto=True, color_discrete_sequence=[COLOR_WARNING])
+            fig.update_layout(yaxis_title=None, xaxis_title="건수", height=max(300, top_n * 25))
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+        else:
+            st.info("데이터 없음")
+
+        with st.expander("🔍 원본 클레임 로그 (필터 적용)"):
+            st.dataframe(
+                dfq[["날짜", "월", "브랜드", "업체", "상품제품", "대분류", "소분류", "품목"]]
+                .sort_values("날짜", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
+
+    # ---------- 탭4: 업로드 이력 ----------
+    with tab4:
         uploads = db.list_uploads(team=TEAM)
         if uploads.empty:
             st.info("업로드 이력이 없습니다.")
         else:
             st.caption("**비활성화**: 데이터에서 제외 (복구 가능) / **영구삭제**: DB에서 제거")
             header = st.columns([1, 3, 2, 2, 1, 1, 1])
-            header[0].markdown("**ID**")
-            header[1].markdown("**파일명**")
-            header[2].markdown("**업로드 일시**")
-            header[3].markdown("**건수**")
-            header[4].markdown("**상태**")
-            header[5].markdown("**토글**")
-            header[6].markdown("**삭제**")
+            for i, lab in enumerate(["**ID**", "**파일명**", "**업로드 일시**", "**건수**", "**상태**", "**토글**", "**삭제**"]):
+                header[i].markdown(lab)
             st.markdown("---")
             for _, row in uploads.iterrows():
                 uid = int(row["upload_id"])
@@ -828,7 +1039,7 @@ if TEAM == "quality":
                 cols[0].write(f"#{uid}")
                 cols[1].write(row["filename"] or "-")
                 cols[2].write(row["uploaded_at"])
-                cols[3].write(f"C:{claims_rows}")
+                cols[3].write(f"{claims_rows} 건")
                 if active:
                     cols[4].markdown(f"<span style='color:{COLOR_SUCCESS};font-weight:600;'>● 활성</span>", unsafe_allow_html=True)
                     if cols[5].button("비활성", key=f"q_deact_{uid}"):

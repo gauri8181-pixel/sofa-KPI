@@ -67,8 +67,13 @@ SCHEMA_STATEMENTS = [
         row_id INTEGER PRIMARY KEY AUTOINCREMENT,
         upload_id INTEGER NOT NULL,
         날짜 TEXT NOT NULL,
-        브랜드 TEXT NOT NULL,
-        건수 INTEGER NOT NULL
+        월 TEXT,
+        브랜드 TEXT,
+        업체 TEXT,
+        상품제품 TEXT,
+        대분류 TEXT,
+        소분류 TEXT,
+        품목 TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_plan_init_date ON production_plan(최초포장계획일)",
     "CREATE INDEX IF NOT EXISTS idx_plan_pack_date ON production_plan(포장계획일)",
@@ -325,13 +330,46 @@ def init_db():
     global _db_initialized
     if _db_initialized:
         return True
+    # 1) 일단 스키마 생성 시도 (없으면 만듦)
     _exec_many([(stmt, ()) for stmt in SCHEMA_STATEMENTS])
-    # 기존 테이블에 컬럼 추가 시도 (이미 있으면 에러 무시)
+    # 2) 기존 테이블에 컬럼 추가 시도 (이미 있으면 에러 무시)
     for migration in MIGRATIONS:
         try:
             _exec_one(migration)
         except Exception:
             pass
+    # 3) quality_claims 옛 스키마 감지 → 드롭 후 재생성
+    try:
+        check = _exec_one("PRAGMA table_info(quality_claims)")
+        cols = [row[1] for row in check["rows"]]
+        # 옛 스키마: 건수 컬럼이 있고, 대분류 컬럼이 없으면 옛 버전
+        if "건수" in cols and "대분류" not in cols:
+            _exec_one("DROP TABLE quality_claims")
+            _exec_one(
+                """CREATE TABLE quality_claims (
+                    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    upload_id INTEGER NOT NULL,
+                    날짜 TEXT NOT NULL,
+                    월 TEXT,
+                    브랜드 TEXT,
+                    업체 TEXT,
+                    상품제품 TEXT,
+                    대분류 TEXT,
+                    소분류 TEXT,
+                    품목 TEXT
+                )"""
+            )
+            for idx_stmt in [
+                "CREATE INDEX IF NOT EXISTS idx_claims_date  ON quality_claims(날짜)",
+                "CREATE INDEX IF NOT EXISTS idx_claims_brand ON quality_claims(브랜드)",
+                "CREATE INDEX IF NOT EXISTS idx_claims_upload ON quality_claims(upload_id)",
+            ]:
+                try:
+                    _exec_one(idx_stmt)
+                except Exception:
+                    pass
+    except Exception:
+        pass
     _db_initialized = True
     return True
 
@@ -467,14 +505,22 @@ def save_upload(
 
     # 4) quality_claims 일괄 INSERT
     if df_claims is not None and not df_claims.empty:
-        claims_cols = ["upload_id", "날짜", "브랜드", "건수"]
+        claims_cols = [
+            "upload_id", "날짜", "월", "브랜드", "업체",
+            "상품제품", "대분류", "소분류", "품목",
+        ]
         claims_rows_data = []
         for _, r in df_claims.iterrows():
             claims_rows_data.append((
                 upload_id,
                 _date_to_iso(r.get("날짜")),
+                str(r.get("월") or "").strip(),
                 str(r.get("브랜드") or "").strip(),
-                int(r.get("건수") or 0),
+                str(r.get("업체") or "").strip(),
+                str(r.get("상품제품") or "").strip(),
+                str(r.get("대분류") or "").strip(),
+                str(r.get("소분류") or "").strip(),
+                str(r.get("품목") or "").strip(),
             ))
         claims_statements = _build_multi_insert("quality_claims", claims_cols, claims_rows_data)
         if claims_statements:
@@ -487,29 +533,22 @@ def save_upload(
 # 품질팀 조회 함수
 # =========================
 def query_claims(start_date, end_date, team: str = "quality") -> pd.DataFrame:
-    """활성 업로드 + (날짜, 브랜드)별 최신 버전만 반환"""
+    """
+    활성 업로드의 클레임 로그 전체 반환 (각 행 = 1건의 클레임).
+    각 업로드는 독립된 클레임 모음이므로 dedup은 upload_id 기준으로 활성 업로드만 필터.
+    """
     init_db()
     sql = """
-    WITH ranked AS (
-        SELECT c.*,
-               ROW_NUMBER() OVER (
-                 PARTITION BY c.날짜, c.브랜드
-                 ORDER BY c.upload_id DESC, c.row_id DESC
-               ) AS rn
-        FROM quality_claims c
-        JOIN upload_log u ON c.upload_id = u.upload_id
-        WHERE u.is_active = 1 AND u.team = ?
-          AND c.날짜 BETWEEN ? AND ?
-    )
-    SELECT 날짜, 브랜드, 건수, upload_id
-    FROM ranked
-    WHERE rn = 1
+    SELECT c.날짜, c.월, c.브랜드, c.업체, c.상품제품, c.대분류, c.소분류, c.품목, c.upload_id
+    FROM quality_claims c
+    JOIN upload_log u ON c.upload_id = u.upload_id
+    WHERE u.is_active = 1 AND u.team = ?
+      AND c.날짜 BETWEEN ? AND ?
     """
     res = _exec_one(sql, (team, _date_to_iso(start_date), _date_to_iso(end_date)))
     df = _result_to_df(res)
     if not df.empty:
         df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce").dt.date
-        df["건수"] = pd.to_numeric(df["건수"], errors="coerce").fillna(0).astype(int)
     return df
 
 

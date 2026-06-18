@@ -702,10 +702,26 @@ sel_vendors = None
 sel_categories = None
 sel_product_type = None
 if TEAM == "quality" and not df_claims_all.empty:
+    # 신구 스키마 호환: 누락된 컬럼 자동 보충 (옛 DB 잔존 시 보호)
+    for required_col in ["월", "업체", "상품제품", "대분류", "소분류", "품목"]:
+        if required_col not in df_claims_all.columns:
+            df_claims_all[required_col] = ""
+
+    # 옛 스키마 데이터가 섞여 있는지 진단
+    has_new_data = (
+        df_claims_all["업체"].astype(str).str.strip().replace("", pd.NA).notna().any()
+        or df_claims_all["대분류"].astype(str).str.strip().replace("", pd.NA).notna().any()
+    )
+    if not has_new_data:
+        st.warning(
+            "⚠️ 옛 스키마(매트릭스) 데이터만 남아있습니다. "
+            "**📜 업로드 이력** 탭에서 옛 업로드를 영구삭제하고, **품질 DATA.xlsx**를 새로 업로드해주세요."
+        )
+
     st.sidebar.header("🔎 추가 필터")
-    vendor_list = sorted([v for v in df_claims_all["업체"].dropna().unique().tolist() if v])
-    cat_list = sorted([v for v in df_claims_all["대분류"].dropna().unique().tolist() if v])
-    ptype_list = sorted([v for v in df_claims_all["상품제품"].dropna().unique().tolist() if v])
+    vendor_list = sorted([v for v in df_claims_all["업체"].dropna().astype(str).unique().tolist() if v])
+    cat_list = sorted([v for v in df_claims_all["대분류"].dropna().astype(str).unique().tolist() if v])
+    ptype_list = sorted([v for v in df_claims_all["상품제품"].dropna().astype(str).unique().tolist() if v])
 
     sel_vendors = st.sidebar.multiselect("업체", vendor_list, default=vendor_list)
     sel_categories = st.sidebar.multiselect("대분류", cat_list, default=cat_list)

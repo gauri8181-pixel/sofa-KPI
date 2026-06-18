@@ -855,6 +855,54 @@ if TEAM == "quality":
         else:
             st.info("표시할 데이터 없음")
 
+        # 최신 월 일자별 그래프 (기간 토글과 무관, 항상 일별)
+        if not dfq.empty:
+            _max_d = dfq["날짜"].max()
+            latest_year = _max_d.year
+            latest_month = _max_d.month
+            dfq_latest = dfq[
+                dfq["날짜"].apply(lambda d: d.year == latest_year and d.month == latest_month)
+            ].copy()
+            if not dfq_latest.empty:
+                daily_latest = (
+                    dfq_latest.groupby("날짜")
+                    .size()
+                    .reset_index(name="클레임건수")
+                    .sort_values("날짜")
+                    .reset_index(drop=True)
+                )
+                month_total = int(daily_latest["클레임건수"].sum())
+                daily_latest["구성비율(%)"] = np.where(
+                    month_total > 0,
+                    daily_latest["클레임건수"] / month_total * 100,
+                    0,
+                )
+                st.markdown(
+                    f"##### 🗓️ 최신 월({latest_year}-{latest_month:02d}) 일자별 클레임 추이"
+                )
+                fig_latest = go.Figure()
+                fig_latest.add_trace(go.Bar(
+                    x=daily_latest["날짜"], y=daily_latest["클레임건수"],
+                    name="클레임 건수", marker_color=COLOR_WARNING,
+                    text=daily_latest["클레임건수"], textposition="outside",
+                ))
+                fig_latest.add_trace(go.Scatter(
+                    x=daily_latest["날짜"], y=daily_latest["구성비율(%)"],
+                    name="구성비율(%)", mode="lines+markers",
+                    line=dict(color=COLOR_ACCENT, width=2),
+                    marker=dict(size=8),
+                    yaxis="y2",
+                ))
+                fig_latest.update_layout(
+                    yaxis=dict(title="클레임 건수"),
+                    yaxis2=dict(
+                        title="구성비율(%) [최신월 내]", overlaying="y", side="right",
+                        tickfont=dict(color="#FFFFFF"), title_font=dict(color="#FFFFFF"),
+                    ),
+                    xaxis_title=None,
+                )
+                st.plotly_chart(style_fig(fig_latest), use_container_width=True)
+
         # 브랜드별 (건수 + 구성비율)
         st.markdown(f"##### 🏷️ 브랜드별 건수 + 구성비율")
         col_a, col_b = st.columns(2)
@@ -1001,15 +1049,30 @@ if TEAM == "quality":
             else:
                 st.info("데이터 없음")
 
-        # 품목 Top N
-        st.markdown("##### 🛋️ 품목 Top N")
+        # 품목 Top N (소분류별 색상 스택드)
+        st.markdown("##### 🛋️ 품목 Top N — 소분류별 누적")
         top_n = st.slider("Top N 개수", 5, 30, 10, key="top_n_items")
         if not item_counts.empty:
-            top_items = item_counts.head(top_n)
-            fig = px.bar(top_items.sort_values("건수"),
-                         x="건수", y="품목", orientation="h",
-                         text_auto=True, color_discrete_sequence=[COLOR_WARNING])
-            fig.update_layout(yaxis_title=None, xaxis_title="건수", height=max(300, top_n * 25))
+            top_items_list = item_counts.head(top_n)["품목"].tolist()
+            # 품목 × 소분류 교차 집계
+            item_sub = (
+                dfq[dfq["품목"].isin(top_items_list)]
+                .groupby(["품목", "소분류"]).size().reset_index(name="건수")
+            )
+            # Y축 순서: 총건수 오름차순 (작은 게 아래, 큰 게 위로)
+            order_map = {p: i for i, p in enumerate(reversed(top_items_list))}
+            item_sub["_order"] = item_sub["품목"].map(order_map)
+            item_sub = item_sub.sort_values("_order")
+            fig = px.bar(
+                item_sub, x="건수", y="품목", color="소분류",
+                orientation="h", barmode="stack", text_auto=True,
+                category_orders={"품목": list(reversed(top_items_list))},
+            )
+            fig.update_layout(
+                yaxis_title=None, xaxis_title="건수",
+                height=max(350, top_n * 30),
+                legend=dict(title="소분류"),
+            )
             st.plotly_chart(style_fig(fig), use_container_width=True)
         else:
             st.info("데이터 없음")

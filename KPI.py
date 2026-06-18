@@ -742,29 +742,11 @@ if TEAM == "quality":
     dfq = dfq[(dfq["날짜"] >= start_date) & (dfq["날짜"] <= end_date)]
     dfq["기간"] = dfq["날짜"].map(lambda d: period_floor(d, period))
 
-    # === 생산 실적 로드 (하자율 계산용) ===
-    try:
-        df_prod = db.query_plan(start_date, end_date, team="production")
-    except Exception:
-        df_prod = pd.DataFrame()
-    if not df_prod.empty:
-        df_prod_actual = df_prod.dropna(subset=["포장계획일"]).copy()
-        df_prod_actual = df_prod_actual[
-            (df_prod_actual["포장계획일"] >= start_date)
-            & (df_prod_actual["포장계획일"] <= end_date)
-        ]
-        # 같은 브랜드 필터 적용 (선택된 브랜드만)
-        df_prod_actual = df_prod_actual[df_prod_actual["브랜드"].isin(selected_brands)]
-        df_prod_actual["기간"] = df_prod_actual["포장계획일"].map(lambda d: period_floor(d, period))
-    else:
-        df_prod_actual = pd.DataFrame(columns=["브랜드", "생산량", "포장계획일", "기간"])
-
     # === 종합 지표 ===
     total_claims = len(dfq)
-    total_production = float(df_prod_actual["생산량"].sum()) if not df_prod_actual.empty else 0.0
-    total_defect_rate = (total_claims / total_production * 100) if total_production > 0 else 0.0
-    n_days = dfq["날짜"].nunique() if not dfq.empty else 0
-    avg_claims_per_day = total_claims / n_days if n_days > 0 else 0
+    # 일평균: 조회 기간의 전체 일수(달력 일수)로 나눔
+    total_period_days = (end_date - start_date).days + 1 if end_date >= start_date else 1
+    avg_claims_per_day = total_claims / total_period_days if total_period_days > 0 else 0
 
     # 최다 브랜드 / 최다 원인
     top_brand = (
@@ -773,44 +755,37 @@ if TEAM == "quality":
     )
     top_brand_name = top_brand.index[0] if len(top_brand) > 0 else "-"
     top_brand_count = int(top_brand.iloc[0]) if len(top_brand) > 0 else 0
+    top_brand_share = (top_brand_count / total_claims * 100) if total_claims > 0 else 0
     top_cause = (
         dfq["소분류"].value_counts().head(1)
         if not dfq.empty else pd.Series(dtype=int)
     )
     top_cause_name = top_cause.index[0] if len(top_cause) > 0 else "-"
+    top_cause_count = int(top_cause.iloc[0]) if len(top_cause) > 0 else 0
+    top_cause_share = (top_cause_count / total_claims * 100) if total_claims > 0 else 0
 
-    # === 기간별 집계 (건수 + 하자율) ===
-    period_claims = (
+    # === 기간별 집계 (건수 + 구성비율) ===
+    period_summary = (
         dfq.groupby("기간").size().reset_index(name="클레임건수")
         if not dfq.empty else pd.DataFrame(columns=["기간", "클레임건수"])
     )
-    period_prod = (
-        df_prod_actual.groupby("기간", as_index=False)["생산량"].sum().rename(columns={"생산량": "실적수량"})
-        if not df_prod_actual.empty else pd.DataFrame(columns=["기간", "실적수량"])
-    )
-    period_summary = pd.merge(period_claims, period_prod, on="기간", how="outer").fillna(0)
     if not period_summary.empty:
-        period_summary["하자율(%)"] = np.where(
-            period_summary["실적수량"] > 0,
-            period_summary["클레임건수"] / period_summary["실적수량"] * 100,
+        period_summary["구성비율(%)"] = np.where(
+            total_claims > 0,
+            period_summary["클레임건수"] / total_claims * 100,
             0,
         )
         period_summary = period_summary.sort_values("기간").reset_index(drop=True)
 
-    # === 브랜드별 집계 (건수 + 하자율) ===
-    brand_claims = (
+    # === 브랜드별 집계 (건수 + 구성비율) ===
+    brand_summary = (
         dfq.groupby("브랜드").size().reset_index(name="클레임건수")
         if not dfq.empty else pd.DataFrame(columns=["브랜드", "클레임건수"])
     )
-    brand_prod = (
-        df_prod_actual.groupby("브랜드", as_index=False)["생산량"].sum().rename(columns={"생산량": "실적수량"})
-        if not df_prod_actual.empty else pd.DataFrame(columns=["브랜드", "실적수량"])
-    )
-    brand_summary = pd.merge(brand_claims, brand_prod, on="브랜드", how="outer").fillna(0)
     if not brand_summary.empty:
-        brand_summary["하자율(%)"] = np.where(
-            brand_summary["실적수량"] > 0,
-            brand_summary["클레임건수"] / brand_summary["실적수량"] * 100,
+        brand_summary["구성비율(%)"] = np.where(
+            total_claims > 0,
+            brand_summary["클레임건수"] / total_claims * 100,
             0,
         )
         brand_summary = brand_summary.sort_values("클레임건수", ascending=False).reset_index(drop=True)
@@ -829,21 +804,33 @@ if TEAM == "quality":
     with tab1:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("총 클레임", f"{total_claims:,} 건")
-        c2.metric("전체 하자율", f"{total_defect_rate:.2f} %",
-                  help="클레임 건수 ÷ 생산팀 실적수량")
-        c3.metric("최다 브랜드", f"{top_brand_name}", f"{top_brand_count:,} 건")
-        c4.metric("최다 원인", f"{top_cause_name}")
+        c2.metric(
+            "최다 브랜드", f"{top_brand_name}",
+            f"{top_brand_count:,} 건 ({top_brand_share:.1f}%)",
+        )
+        c3.metric(
+            "최다 원인", f"{top_cause_name}",
+            f"{top_cause_count:,} 건 ({top_cause_share:.1f}%)",
+        )
+        c4.metric(
+            "일평균 클레임", f"{avg_claims_per_day:.2f} 건/일",
+            help=f"전체 건수 ÷ 조회 기간 일수({total_period_days}일)",
+        )
 
         c5, c6, c7, c8 = st.columns(4)
-        c5.metric("총 실적수량", f"{total_production:,.0f} 개")
-        c6.metric("일평균 클레임", f"{avg_claims_per_day:.1f} 건/일")
-        c7.metric("조회 일수", f"{n_days} 일")
-        c8.metric("필터링 브랜드", f"{len(selected_brands)} 개")
+        c5.metric("조회 기간 일수", f"{total_period_days} 일")
+        c6.metric("발생 일수", f"{dfq['날짜'].nunique() if not dfq.empty else 0} 일")
+        c7.metric("필터링 브랜드", f"{len(selected_brands)} 개")
+        c8.metric(
+            "건/발생일",
+            f"{(total_claims / dfq['날짜'].nunique()) if (not dfq.empty and dfq['날짜'].nunique() > 0) else 0:.1f} 건",
+            help="발생한 날만 카운팅한 평균"
+        )
 
         st.markdown("<br/>", unsafe_allow_html=True)
 
-        # 기간 추이 (건수 bar + 하자율 line, 이중 축)
-        st.markdown(f"##### 📈 {period} 클레임 건수 + 하자율 추이")
+        # 기간 추이 (건수 bar + 구성비율 line, 이중 축)
+        st.markdown(f"##### 📈 {period} 클레임 건수 + 구성비율 추이")
         if not period_summary.empty:
             fig = go.Figure()
             fig.add_trace(go.Bar(
@@ -852,15 +839,15 @@ if TEAM == "quality":
                 text=period_summary["클레임건수"], textposition="outside",
             ))
             fig.add_trace(go.Scatter(
-                x=period_summary["기간"], y=period_summary["하자율(%)"],
-                name="하자율(%)", mode="lines+markers",
+                x=period_summary["기간"], y=period_summary["구성비율(%)"],
+                name="구성비율(%)", mode="lines+markers",
                 line=dict(color=COLOR_ACCENT, width=3),
                 marker=dict(size=8),
                 yaxis="y2",
             ))
             fig.update_layout(
                 yaxis=dict(title="클레임 건수"),
-                yaxis2=dict(title="하자율(%)", overlaying="y", side="right",
+                yaxis2=dict(title="구성비율(%)", overlaying="y", side="right",
                             tickfont=dict(color="#FFFFFF"), title_font=dict(color="#FFFFFF")),
                 xaxis_title=None,
             )
@@ -868,8 +855,8 @@ if TEAM == "quality":
         else:
             st.info("표시할 데이터 없음")
 
-        # 브랜드별 (건수 + 하자율)
-        st.markdown(f"##### 🏷️ 브랜드별 건수 + 하자율")
+        # 브랜드별 (건수 + 구성비율)
+        st.markdown(f"##### 🏷️ 브랜드별 건수 + 구성비율")
         col_a, col_b = st.columns(2)
         with col_a:
             if not brand_summary.empty:
@@ -880,15 +867,15 @@ if TEAM == "quality":
                     text=brand_summary["클레임건수"], textposition="outside",
                 ))
                 fig_b.add_trace(go.Scatter(
-                    x=brand_summary["브랜드"], y=brand_summary["하자율(%)"],
-                    name="하자율(%)", mode="markers+lines",
+                    x=brand_summary["브랜드"], y=brand_summary["구성비율(%)"],
+                    name="구성비율(%)", mode="markers+lines",
                     line=dict(color=COLOR_ACCENT, width=2, dash="dot"),
                     marker=dict(size=10),
                     yaxis="y2",
                 ))
                 fig_b.update_layout(
                     yaxis=dict(title="클레임 건수"),
-                    yaxis2=dict(title="하자율(%)", overlaying="y", side="right",
+                    yaxis2=dict(title="구성비율(%)", overlaying="y", side="right",
                                 tickfont=dict(color="#FFFFFF"), title_font=dict(color="#FFFFFF")),
                     xaxis_title=None,
                 )
@@ -909,19 +896,17 @@ if TEAM == "quality":
 
         st.markdown("##### 📋 브랜드별 상세")
         if not brand_summary.empty:
-            bs_disp = brand_summary[["브랜드", "클레임건수", "실적수량", "하자율(%)"]].copy()
+            bs_disp = brand_summary[["브랜드", "클레임건수", "구성비율(%)"]].copy()
             total_row = pd.DataFrame([{
                 "브랜드": "합계",
                 "클레임건수": total_claims,
-                "실적수량": total_production,
-                "하자율(%)": total_defect_rate,
+                "구성비율(%)": 100.0,
             }])
             bs_disp = pd.concat([bs_disp, total_row], ignore_index=True)
             st.dataframe(
                 bs_disp.style.format({
                     "클레임건수": "{:,.0f}",
-                    "실적수량": "{:,.0f}",
-                    "하자율(%)": "{:.2f}",
+                    "구성비율(%)": "{:.1f}",
                 }),
                 use_container_width=True, hide_index=True,
             )
